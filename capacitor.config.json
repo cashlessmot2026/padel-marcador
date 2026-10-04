@@ -1,0 +1,15 @@
+{
+  "appId": "app.itagscore",
+  "appName": "iTag Score",
+  "webDir": "dist",
+  "plugins": {
+    "BluetoothLe": {
+      "displayStrings": {
+        "scanning": "Buscando iTag…",
+        "cancel": "Cancelar",
+        "availableDevices": "Dispositivos disponibles",
+        "noDeviceFound": "No se encontró ningún iTag"
+      }
+    }
+  }
+}

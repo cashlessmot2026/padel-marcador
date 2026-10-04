@@ -1,0 +1,779 @@
+// iTag Score — marcador con botones Bluetooth iTag (Web · Android · iOS)
+// Todo el código de la app vive en este archivo.
+import { useCallback, useEffect, useReducer, useRef, useState, useSyncExternalStore } from 'react'
+import { createClient } from '@supabase/supabase-js'
+import { Capacitor } from '@capacitor/core'
+import { BleClient, numberToUUID, numbersToDataView } from '@capacitor-community/bluetooth-le'
+import './App.css'
+
+/* ═════════════════════════ SUPABASE ═════════════════════════ */
+const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL || 'https://aswuqsenfjgwqsesethe.supabase.co'
+const SUPABASE_ANON_KEY =
+  import.meta.env.VITE_SUPABASE_ANON_KEY ||
+  'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFzd3Vxc2VuZmpnd3FzZXNldGhlIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODgyMDI1NTQsImV4cCI6MjEwMzc3ODU1NH0.cZCMLIsLAEXwOsbXS7wpfnI7xb-kqK-sduHPjrCndbQ'
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
+
+/* ═════════════════════════ MARCADOR (lógica pura) ═════════════════════════ */
+const TENNIS = ['0', '15', '30', '40']
+const GAMES_PER_SET = 6
+
+const newGame = (server = 0) => ({
+  points: [0, 0], games: [0, 0], sets: [0, 0],
+  setLog: [], server, last: null, tiebreak: false, v: 0,
+})
+
+function closeSet(g, p, finalScore) {
+  const sets = [...g.sets]
+  sets[p]++
+  return { ...g, sets, setLog: [...g.setLog, finalScore], points: [0, 0], games: [0, 0], tiebreak: false }
+}
+
+function addPoint(g, p, cfg) {
+  const o = 1 - p
+  const pts = [...g.points]
+  pts[p]++
+  let n = { ...g, points: pts, last: p }
+
+  if (cfg.mode === 'points') {
+    const t = cfg.target
+    const deuce = pts[0] >= t - 1 && pts[1] >= t - 1
+    if (deuce || (pts[0] + pts[1]) % 2 === 0) n.server = 1 - g.server
+    if (pts[p] >= t && pts[p] - pts[o] >= 2) n = closeSet(n, p, pts)
+    return n
+  }
+
+  if (g.tiebreak) {
+    if ((pts[0] + pts[1]) % 2 === 1) n.server = 1 - g.server
+    if (pts[p] >= 7 && pts[p] - pts[o] >= 2) {
+      const games = [...g.games]
+      games[p]++
+      n = closeSet({ ...n, server: 1 - g.server }, p, games)
+    }
+    return n
+  }
+
+  if (pts[p] >= 4 && pts[p] - pts[o] >= 2) {
+    const games = [...g.games]
+    games[p]++
+    n = { ...n, games, points: [0, 0], server: 1 - g.server }
+    if (games[p] >= GAMES_PER_SET && games[p] - games[o] >= 2) n = closeSet(n, p, games)
+    else if (games[0] === GAMES_PER_SET && games[1] === GAMES_PER_SET) n.tiebreak = true
+  }
+  return n
+}
+
+function labels(g, cfg) {
+  if (cfg.mode === 'points' || g.tiebreak)
+    return { a: [String(g.points[0]), String(g.points[1])], note: g.tiebreak ? 'TIE-BREAK' : '' }
+  const [a, b] = g.points
+  if (a >= 3 && b >= 3) {
+    if (a === b) return { a: ['40', '40'], note: 'IGUALES' }
+    return { a: a > b ? ['AD', '40'] : ['40', 'AD'], note: 'VENTAJA' }
+  }
+  return { a: [TENNIS[a], TENNIS[b]], note: '' }
+}
+
+function winnerSlot(g) {
+  for (const k of ['sets', 'games', 'points']) {
+    if (g[k][0] !== g[k][1]) return g[k][0] > g[k][1] ? 0 : 1
+  }
+  return null
+}
+
+const SAY = { 0: 'cero', 15: 'quince', 30: 'treinta', 40: 'cuarenta' }
+function announceText(g, cfg, names) {
+  const { a, note } = labels(g, cfg)
+  if (note === 'IGUALES') return 'Iguales'
+  if (note === 'VENTAJA') return `Ventaja ${names[a[0] === 'AD' ? 0 : 1]}`
+  if (g.points[0] === 0 && g.points[1] === 0 && g.last !== null) {
+    const unit = cfg.mode === 'points' ? 'Sets' : 'Juegos'
+    const v = cfg.mode === 'points' ? g.sets : g.games
+    return `${unit}: ${names[0]} ${v[0]}, ${names[1]} ${v[1]}`
+  }
+  const s = g.server
+  return `${SAY[a[s]] ?? a[s]}, ${SAY[a[1 - s]] ?? a[1 - s]}`
+}
+
+// Estado + historial para deshacer
+const pushState = (s, game) => ({ game, past: [...s.past.slice(-200), s.game] })
+function scoreReducer(s, a) {
+  switch (a.type) {
+    case 'point': return pushState(s, { ...addPoint(s.game, a.p, a.cfg), v: a.v })
+    case 'undo': return s.past.length ? { game: { ...s.past.at(-1), v: a.v }, past: s.past.slice(0, -1) } : s
+    case 'reset': return pushState(s, { ...newGame(s.game.server), v: a.v })
+    case 'server': return pushState(s, { ...s.game, server: 1 - s.game.server, v: a.v })
+    case 'remote':
+      if ((a.game?.v ?? 0) <= (s.game.v ?? 0)) return s
+      return { game: a.game, past: a.past ?? s.past }
+    default: return s
+  }
+}
+
+/* ═════════════════════════ PULSACIONES (1 = punto, 2 = deshacer, 3 / mantener = borrar) ═════════════════════════ */
+function makeClickDecoder(onAction, wait = 380) {
+  let n = 0, t
+  return () => {
+    n++
+    clearTimeout(t)
+    t = setTimeout(() => {
+      const c = n
+      n = 0
+      onAction(c === 1 ? 'point' : c === 2 ? 'undo' : 'reset')
+    }, wait)
+  }
+}
+
+/* ═════════════════════════ BLUETOOTH iTAG ═════════════════════════ */
+const ITAG_SVC = numberToUUID(0xffe0)
+const ITAG_BTN = numberToUUID(0xffe1)
+const ALERT_SVC = numberToUUID(0x1802)
+const LINK_LOSS_SVC = numberToUUID(0x1803)
+const ALERT_LEVEL = numberToUUID(0x2a06)
+const HOLD_MS = 900
+
+const isNative = Capacitor.isNativePlatform()
+const bleSupported = isNative || (typeof navigator !== 'undefined' && !!navigator.bluetooth)
+
+// Almacén global: los iTag siguen conectados aunque cambies de pantalla
+const itags = {
+  slots: [null, null], // { deviceId, name, status }
+  handlers: [null, null], // (kind: 'click' | 'hold') => void
+  listeners: new Set(),
+  set(slot, val) {
+    this.slots = this.slots.map((s, i) => (i === slot ? val : s))
+    this.listeners.forEach((l) => l())
+  },
+  subscribe(l) { itags.listeners.add(l); return () => itags.listeners.delete(l) },
+  snapshot() { return itags.slots },
+}
+let bleInit
+const ensureBle = () => (bleInit ??= BleClient.initialize({ androidNeverForLocation: true }))
+
+async function connectItag(slot) {
+  await ensureBle()
+  const dev = await BleClient.requestDevice({ optionalServices: [ITAG_SVC, ALERT_SVC, LINK_LOSS_SVC] })
+  itags.set(slot, { deviceId: dev.deviceId, name: dev.name || 'iTag', status: 'connecting' })
+  await BleClient.connect(dev.deviceId, () => {
+    if (itags.slots[slot]?.deviceId === dev.deviceId) itags.set(slot, { ...itags.slots[slot], status: 'lost' })
+  })
+  // Evita que el iTag pite al perder la conexión
+  BleClient.write(dev.deviceId, LINK_LOSS_SVC, ALERT_LEVEL, numbersToDataView([0])).catch(() => {})
+
+  // Algunos iTag envían 1 al pulsar y 0 al soltar: así detectamos "mantener presionado".
+  // Los que solo envían un aviso por clic usan triple clic para borrar.
+  let downAt = 0
+  let sendsRelease = false
+  let holdTimer
+  const fire = (k) => itags.handlers[slot]?.(k)
+  await BleClient.startNotifications(dev.deviceId, ITAG_SVC, ITAG_BTN, (value) => {
+    const pressed = value.byteLength ? value.getUint8(0) !== 0 : true
+    if (!pressed) {
+      // Soltó el botón
+      const wasFirstRelease = !sendsRelease
+      sendsRelease = true
+      clearTimeout(holdTimer)
+      if (downAt && !wasFirstRelease) fire('click')
+      downAt = 0
+      return
+    }
+    downAt = Date.now()
+    if (!sendsRelease) { fire('click'); return }
+    holdTimer = setTimeout(() => { if (downAt) { downAt = 0; fire('hold') } }, HOLD_MS)
+  })
+  itags.set(slot, { deviceId: dev.deviceId, name: dev.name || 'iTag', status: 'connected' })
+}
+
+async function beepItag(slot) {
+  const s = itags.slots[slot]
+  if (!s) return
+  try {
+    await BleClient.write(s.deviceId, ALERT_SVC, ALERT_LEVEL, numbersToDataView([2]))
+    setTimeout(() => BleClient.write(s.deviceId, ALERT_SVC, ALERT_LEVEL, numbersToDataView([0])).catch(() => {}), 600)
+  } catch { /* algunos iTag no soportan alerta */ }
+}
+
+async function disconnectItag(slot) {
+  const s = itags.slots[slot]
+  itags.set(slot, null)
+  if (s) await BleClient.disconnect(s.deviceId).catch(() => {})
+}
+
+/* ═════════════════════════ UTILIDADES DE PANTALLA / SONIDO ═════════════════════════ */
+let audioCtx
+function blip(freq = 880) {
+  try {
+    audioCtx ??= new (window.AudioContext || window.webkitAudioContext)()
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain()
+    o.frequency.value = freq
+    g.gain.setValueAtTime(0.15, audioCtx.currentTime)
+    g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.18)
+    o.connect(g).connect(audioCtx.destination)
+    o.start()
+    o.stop(audioCtx.currentTime + 0.2)
+  } catch { /* sin audio */ }
+}
+
+function speak(text) {
+  if (!('speechSynthesis' in window)) return
+  speechSynthesis.cancel()
+  const u = new SpeechSynthesisUtterance(text)
+  u.lang = 'es-ES'
+  speechSynthesis.speak(u)
+}
+
+function useWakeLock(active) {
+  useEffect(() => {
+    if (!active || !('wakeLock' in navigator)) return
+    let lock
+    const req = () => navigator.wakeLock.request('screen').then((l) => (lock = l)).catch(() => {})
+    req()
+    const onVis = () => document.visibilityState === 'visible' && req()
+    document.addEventListener('visibilitychange', onVis)
+    return () => { document.removeEventListener('visibilitychange', onVis); lock?.release().catch(() => {}) }
+  }, [active])
+}
+
+async function toggleFullscreen() {
+  try {
+    if (document.fullscreenElement) return await document.exitFullscreen()
+    await document.documentElement.requestFullscreen()
+    await screen.orientation?.lock?.('landscape').catch(() => {})
+  } catch { /* iOS Safari no tiene fullscreen API: usar "Añadir a pantalla de inicio" */ }
+}
+
+const lsGet = (k, d) => { try { return JSON.parse(localStorage.getItem(k)) ?? d } catch { return d } }
+const lsSet = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)) } catch { /* ignore */ } }
+
+/* ═════════════════════════ APP ═════════════════════════ */
+export default function App() {
+  const [session, setSession] = useState(undefined)
+  const [profile, setProfile] = useState(null)
+  const [matchId, setMatchId] = useState(null)
+
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data }) => setSession(data.session))
+    const { data } = supabase.auth.onAuthStateChange((_e, s) => setSession(s))
+    return () => data.subscription.unsubscribe()
+  }, [])
+
+  useEffect(() => {
+    if (!session) { setProfile(null); return }
+    supabase.from('profiles').select('*').eq('id', session.user.id).single()
+      .then(({ data }) => setProfile(data ?? {
+        id: session.user.id,
+        username: session.user.user_metadata?.username ?? '',
+        display_name: session.user.user_metadata?.display_name ?? 'Jugador',
+      }))
+  }, [session])
+
+  if (session === undefined) return <div className="center muted">Cargando…</div>
+  if (!session) return <Auth />
+  if (!profile) return <div className="center muted">Cargando perfil…</div>
+  if (matchId) return <Match id={matchId} me={profile} onExit={() => setMatchId(null)} />
+  return <Home me={profile} onOpen={setMatchId} />
+}
+
+/* ─────────────── Registro rápido / Entrar ─────────────── */
+function Auth() {
+  const [mode, setMode] = useState('signup')
+  const [f, setF] = useState({ name: '', username: '', email: '', password: '' })
+  const [msg, setMsg] = useState(null)
+  const [busy, setBusy] = useState(false)
+  const up = (k) => (e) => setF({ ...f, [k]: e.target.value })
+
+  async function submit(e) {
+    e.preventDefault()
+    setBusy(true)
+    setMsg(null)
+    try {
+      if (mode === 'signup') {
+        const username = f.username.trim().toLowerCase()
+        if (!/^[a-z0-9_]{3,20}$/.test(username)) throw new Error('Usuario: 3-20 letras minúsculas, números o _')
+        const { data: free, error: e1 } = await supabase.rpc('username_available', { u: username })
+        if (e1) throw e1
+        if (!free) throw new Error('Ese usuario ya existe')
+        const { data, error } = await supabase.auth.signUp({
+          email: f.email.trim(),
+          password: f.password,
+          options: { data: { username, display_name: f.name.trim() || username } },
+        })
+        if (error) throw error
+        if (!data.session) setMsg({ ok: true, text: 'Cuenta creada. Revisa tu correo para confirmar y luego entra.' })
+      } else {
+        const { error } = await supabase.auth.signInWithPassword({ email: f.email.trim(), password: f.password })
+        if (error) throw error
+      }
+    } catch (err) {
+      setMsg({ ok: false, text: err.message })
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div className="auth">
+      <div className="brand"><span className="ball" /> iTag Score</div>
+      <p className="muted">Marcador en vivo controlado con botones iTag</p>
+      <div className="tabs">
+        <button className={mode === 'signup' ? 'on' : ''} onClick={() => setMode('signup')}>Registro rápido</button>
+        <button className={mode === 'login' ? 'on' : ''} onClick={() => setMode('login')}>Entrar</button>
+      </div>
+      <form onSubmit={submit} className="card form">
+        {mode === 'signup' && (
+          <>
+            <input placeholder="Tu nombre" value={f.name} onChange={up('name')} required />
+            <input placeholder="Usuario (para que te encuentren)" value={f.username} onChange={up('username')}
+              autoCapitalize="none" required />
+          </>
+        )}
+        <input type="email" placeholder="Correo" value={f.email} onChange={up('email')} autoComplete="email" required />
+        <input type="password" placeholder="Contraseña (mín. 6)" value={f.password} onChange={up('password')}
+          minLength={6} autoComplete={mode === 'signup' ? 'new-password' : 'current-password'} required />
+        <button className="btn primary" disabled={busy}>{busy ? '…' : mode === 'signup' ? 'Crear cuenta' : 'Entrar'}</button>
+        {msg && <p className={msg.ok ? 'ok' : 'err'}>{msg.text}</p>}
+      </form>
+    </div>
+  )
+}
+
+/* ─────────────── Inicio: buscar, invitar, invitaciones, historial ─────────────── */
+function Home({ me, onOpen }) {
+  const [q, setQ] = useState('')
+  const [results, setResults] = useState([])
+  const [opponent, setOpponent] = useState(null) // perfil o { local: true, display_name }
+  const [localName, setLocalName] = useState('')
+  const [mode, setMode] = useState(() => lsGet('mode', 'tennis'))
+  const [target, setTarget] = useState(() => lsGet('target', 11))
+  const [matches, setMatches] = useState([])
+  const [err, setErr] = useState(null)
+
+  const load = useCallback(async () => {
+    const { data } = await supabase.from('matches').select('*')
+      .or(`host_id.eq.${me.id},player1_id.eq.${me.id},player2_id.eq.${me.id}`)
+      .order('created_at', { ascending: false }).limit(40)
+    setMatches(data ?? [])
+  }, [me.id])
+
+  useEffect(() => {
+    load()
+    const ch = supabase.channel(`home-${me.id}`)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'matches' }, load)
+      .subscribe()
+    return () => { supabase.removeChannel(ch) }
+  }, [load, me.id])
+
+  useEffect(() => {
+    const term = q.trim().replace(/[^\p{L}\p{N}_ ]/gu, '')
+    if (term.length < 2) { setResults([]); return }
+    const t = setTimeout(async () => {
+      const { data } = await supabase.from('profiles').select('id,username,display_name')
+        .or(`username.ilike.%${term}%,display_name.ilike.%${term}%`).neq('id', me.id).limit(10)
+      setResults(data ?? [])
+    }, 250)
+    return () => clearTimeout(t)
+  }, [q, me.id])
+
+  async function create() {
+    setErr(null)
+    lsSet('mode', mode)
+    lsSet('target', target)
+    const local = opponent?.local
+    const { data, error } = await supabase.from('matches').insert({
+      host_id: me.id,
+      player1_id: me.id, player1_name: me.display_name,
+      player2_id: local ? null : opponent.id, player2_name: opponent.display_name,
+      mode, target: Number(target) || 11,
+      status: local ? 'active' : 'invited',
+      state: newGame(),
+    }).select().single()
+    if (error) return setErr(error.message)
+    setOpponent(null)
+    setQ('')
+    if (local) onOpen(data.id)
+  }
+
+  async function respond(m, accept) {
+    await supabase.from('matches').update({ status: accept ? 'active' : 'declined' }).eq('id', m.id)
+    if (accept) onOpen(m.id)
+  }
+
+  const invites = matches.filter((m) => m.status === 'invited' && m.player2_id === me.id)
+  const waiting = matches.filter((m) => m.status === 'invited' && m.host_id === me.id)
+  const live = matches.filter((m) => m.status === 'active')
+  const done = matches.filter((m) => m.status === 'finished').slice(0, 15)
+
+  return (
+    <div className="home">
+      <header className="top">
+        <div className="brand sm"><span className="ball" /> iTag Score</div>
+        <div className="who">
+          <b>{me.display_name}</b> <span className="muted">@{me.username}</span>
+          <button className="btn ghost sm" onClick={() => supabase.auth.signOut()}>Salir</button>
+        </div>
+      </header>
+
+      {invites.length > 0 && (
+        <section className="card invite-card">
+          <h3>📨 Invitaciones</h3>
+          {invites.map((m) => (
+            <div key={m.id} className="row">
+              <span><b>{m.player1_name}</b> te invita · {m.mode === 'tennis' ? 'Tenis' : `A ${m.target} pts`}</span>
+              <span className="actions">
+                <button className="btn primary sm" onClick={() => respond(m, true)}>Aceptar</button>
+                <button className="btn ghost sm" onClick={() => respond(m, false)}>Rechazar</button>
+              </span>
+            </div>
+          ))}
+        </section>
+      )}
+
+      <section className="card">
+        <h3>Nuevo partido</h3>
+        {!opponent ? (
+          <>
+            <input placeholder="Buscar jugador por nombre o @usuario" value={q} onChange={(e) => setQ(e.target.value)}
+              autoCapitalize="none" />
+            <div className="results">
+              {results.map((p) => (
+                <button key={p.id} className="result" onClick={() => setOpponent(p)}>
+                  <span className="avatar">{p.display_name[0]?.toUpperCase()}</span>
+                  <span><b>{p.display_name}</b> <span className="muted">@{p.username}</span></span>
+                  <span className="pill">Invitar</span>
+                </button>
+              ))}
+              {q.trim().length >= 2 && !results.length && <p className="muted">Sin resultados</p>}
+            </div>
+            <div className="or">o juega aquí mismo con un amigo sin cuenta</div>
+            <div className="inline">
+              <input placeholder="Nombre del rival" value={localName} onChange={(e) => setLocalName(e.target.value)} />
+              <button className="btn" disabled={!localName.trim()}
+                onClick={() => setOpponent({ local: true, display_name: localName.trim() })}>Elegir</button>
+            </div>
+          </>
+        ) : (
+          <>
+            <div className="vs">
+              <b>{me.display_name}</b> <span className="muted">vs</span> <b>{opponent.display_name}</b>
+              <button className="btn ghost sm" onClick={() => setOpponent(null)}>Cambiar</button>
+            </div>
+            <div className="seg">
+              <button className={mode === 'tennis' ? 'on' : ''} onClick={() => setMode('tennis')}>🎾 Tenis / Pádel</button>
+              <button className={mode === 'points' ? 'on' : ''} onClick={() => setMode('points')}>🏓 Por puntos</button>
+            </div>
+            {mode === 'points' && (
+              <label className="inline">Puntos por set
+                <input type="number" min="1" max="99" value={target} onChange={(e) => setTarget(e.target.value)} />
+              </label>
+            )}
+            <button className="btn primary block" onClick={create}>
+              {opponent.local ? 'Empezar partido' : `Invitar a ${opponent.display_name}`}
+            </button>
+          </>
+        )}
+        {err && <p className="err">{err}</p>}
+      </section>
+
+      {(live.length > 0 || waiting.length > 0) && (
+        <section className="card">
+          <h3>En curso</h3>
+          {live.map((m) => (
+            <button key={m.id} className="row link" onClick={() => onOpen(m.id)}>
+              <span><b>{m.player1_name}</b> vs <b>{m.player2_name}</b></span>
+              <span className="pill live">● En vivo</span>
+            </button>
+          ))}
+          {waiting.map((m) => (
+            <div key={m.id} className="row">
+              <span>Esperando a <b>{m.player2_name}</b>…</span>
+              <button className="btn ghost sm" onClick={() => supabase.from('matches').delete().eq('id', m.id)}>Cancelar</button>
+            </div>
+          ))}
+        </section>
+      )}
+
+      {done.length > 0 && (
+        <section className="card">
+          <h3>Historial</h3>
+          {done.map((m) => (
+            <div key={m.id} className="row">
+              <span>{m.player1_name} vs {m.player2_name}
+                <span className="muted"> · {(m.state?.setLog ?? []).map((s) => s.join('-')).join(', ')}</span></span>
+              <span className="pill">🏆 {m.winner_name ?? 'Empate'}</span>
+            </div>
+          ))}
+        </section>
+      )}
+
+      {!bleSupported && (
+        <p className="warn">
+          Este navegador no tiene Bluetooth. En iPhone usa la app nativa o el navegador <b>Bluefy</b>;
+          en Android usa Chrome.
+        </p>
+      )}
+    </div>
+  )
+}
+
+/* ─────────────── Partido / Marcador ─────────────── */
+function Match({ id, me, onExit }) {
+  const [match, setMatch] = useState(null)
+  const [s, dispatch] = useReducer(scoreReducer, { game: newGame(), past: [] })
+  const [toast, setToast] = useState(null)
+  const [showSetup, setShowSetup] = useState(false)
+  const [autoSpeak, setAutoSpeak] = useState(() => lsGet('autoSpeak', true))
+  const slots = useSyncExternalStore(itags.subscribe, itags.snapshot)
+  const chRef = useRef(null)
+  const localRef = useRef(false)
+  useWakeLock(true)
+
+  const cfg = match ? { mode: match.mode, target: match.target } : { mode: 'tennis', target: 11 }
+  const names = match ? [match.player1_name, match.player2_name] : ['', '']
+  const mySlot = match?.player2_id === me.id && match?.host_id !== me.id ? 1 : 0
+  const finished = match?.status === 'finished'
+
+  // Cargar partido + suscripción en tiempo real
+  useEffect(() => {
+    let alive = true
+    supabase.from('matches').select('*').eq('id', id).single().then(({ data }) => {
+      if (!alive || !data) return
+      setMatch(data)
+      if (data.state) dispatch({ type: 'remote', game: { ...data.state, v: Math.max(data.state.v ?? 0, 1) } })
+    })
+    const ch = supabase.channel(`match-${id}`, { config: { broadcast: { self: false } } })
+      .on('broadcast', { event: 'state' }, ({ payload }) => dispatch({ type: 'remote', ...payload }))
+      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'matches', filter: `id=eq.${id}` },
+        ({ new: row }) => {
+          setMatch(row)
+          if (row.state) dispatch({ type: 'remote', game: row.state })
+        })
+      .subscribe()
+    chRef.current = ch
+    return () => { alive = false; supabase.removeChannel(ch) }
+  }, [id])
+
+  // Acción local → aplicar, transmitir y guardar
+  const act = useCallback((type, p) => {
+    if (match?.status === 'finished') return
+    localRef.current = true
+    dispatch({ type, p, cfg: { mode: match?.mode ?? 'tennis', target: match?.target ?? 11 }, v: Date.now() })
+    if (type === 'point') blip(p === 0 ? 880 : 660)
+    if (type === 'undo') { blip(330); setToast('↩ Punto devuelto') }
+    if (type === 'reset') { blip(220); setToast('🧹 Marcador borrado · doble toque para recuperarlo') }
+  }, [match?.mode, match?.target, match?.status])
+
+  const saveTimer = useRef()
+  useEffect(() => {
+    if (!localRef.current) return
+    localRef.current = false
+    chRef.current?.send({ type: 'broadcast', event: 'state', payload: { game: s.game, past: s.past.slice(-30) } })
+    clearTimeout(saveTimer.current)
+    saveTimer.current = setTimeout(() => supabase.from('matches').update({ state: s.game }).eq('id', id), 400)
+    if (autoSpeak && match) speak(announceText(s.game, cfg, names))
+  }, [s.game]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => { if (toast) { const t = setTimeout(() => setToast(null), 1800); return () => clearTimeout(t) } }, [toast])
+
+  // Conectar los iTag de este dispositivo con el marcador
+  const actRef = useRef(act)
+  actRef.current = act
+  useEffect(() => {
+    const decoders = [0, 1].map((p) => makeClickDecoder((a) => actRef.current(a, p)))
+    ;[0, 1].forEach((p) => {
+      itags.handlers[p] = (kind) => (kind === 'hold' ? actRef.current('reset', p) : decoders[p]())
+    })
+    return () => { itags.handlers = [null, null] }
+  }, [])
+
+  async function finish() {
+    if (!confirm('¿Finalizar el partido?')) return
+    const w = winnerSlot(s.game)
+    const { data } = await supabase.from('matches').update({
+      status: 'finished', state: s.game, finished_at: new Date().toISOString(),
+      winner_slot: w, winner_name: w === null ? null : names[w],
+    }).eq('id', id).select().single()
+    if (data) setMatch(data)
+  }
+
+  if (!match) return <div className="center muted">Cargando partido…</div>
+  if (match.status === 'invited')
+    return (
+      <div className="center col">
+        <p>Esperando que <b>{match.player2_name}</b> acepte la invitación…</p>
+        <button className="btn" onClick={onExit}>Volver</button>
+      </div>
+    )
+
+  const g = s.game
+  const { a: lbl, note } = labels(g, cfg)
+
+  return (
+    <div className="board">
+      {[0, 1].map((p) => (
+        <Half key={p} p={p} name={names[p]} label={lbl[p]} serving={g.server === p}
+          lit={g.last === p} onAction={(a) => act(a, p)} itag={slots[p]} />
+      ))}
+
+      <div className="hud">
+        <table className="sets">
+          <tbody>
+            {[0, 1].map((p) => (
+              <tr key={p}>
+                <td className="nm">{names[p]}</td>
+                {g.setLog.map((set, i) => <td key={i} className={set[p] > set[1 - p] ? 'w' : ''}>{set[p]}</td>)}
+                {cfg.mode === 'tennis' && <td className="cur">{g.games[p]}</td>}
+                <td className="tot">{g.sets[p]}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        {note && <div className="note">{note}</div>}
+      </div>
+
+      <div className="toolbar">
+        <button title="Salir" onClick={onExit}>←</button>
+        <button title="Deshacer" className="orange" onClick={() => act('undo', 0)}>↶</button>
+        <button title="Anunciar" className="blue" onClick={() => speak(announceText(g, cfg, names))}>📢</button>
+        <button title="Cambiar saque" onClick={() => act('server', 0)}>🎾⇄</button>
+        <button title="iTags" onClick={() => setShowSetup(true)}>
+          📡 {slots.filter((x) => x?.status === 'connected').length}/2
+        </button>
+        <button title="Pantalla completa / TV" onClick={toggleFullscreen}>⛶</button>
+        <button title="Finalizar" className="red" onClick={finish}>🏁</button>
+      </div>
+
+      {toast && <div className="toast">{toast}</div>}
+
+      {showSetup && (
+        <ItagSetup names={names} mySlot={mySlot} slots={slots} autoSpeak={autoSpeak}
+          setAutoSpeak={(v) => { setAutoSpeak(v); lsSet('autoSpeak', v) }} onClose={() => setShowSetup(false)} />
+      )}
+
+      {finished && <Winner match={match} game={g} names={names} onExit={onExit} />}
+    </div>
+  )
+}
+
+function Half({ p, name, label, serving, lit, onAction, itag }) {
+  const decoder = useRef(null)
+  const hold = useRef({ t: null, fired: false })
+  const onActionRef = useRef(onAction)
+  onActionRef.current = onAction
+  decoder.current ??= makeClickDecoder((a) => onActionRef.current(a))
+
+  const down = () => {
+    hold.current.fired = false
+    hold.current.t = setTimeout(() => { hold.current.fired = true; onActionRef.current('reset') }, 800)
+  }
+  const up = () => {
+    clearTimeout(hold.current.t)
+    if (!hold.current.fired) decoder.current()
+  }
+  const cancel = () => clearTimeout(hold.current.t)
+
+  return (
+    <div className={`half h${p} ${lit ? 'lit' : ''}`} onPointerDown={down} onPointerUp={up} onPointerLeave={cancel}
+      onContextMenu={(e) => e.preventDefault()}>
+      <div className="pname">
+        <span className="tag">{name}</span>
+        {itag && <span className={`dot ${itag.status}`} title={itag.name} />}
+      </div>
+      {serving && <span className="serve" />}
+      <div className="score">{label}</div>
+    </div>
+  )
+}
+
+function ItagSetup({ names, mySlot, slots, autoSpeak, setAutoSpeak, onClose }) {
+  const [busy, setBusy] = useState(null)
+  const [err, setErr] = useState(null)
+
+  async function link(slot) {
+    setErr(null)
+    setBusy(slot)
+    try { await connectItag(slot) } catch (e) { if (!/cancel/i.test(e.message)) setErr(e.message) }
+    setBusy(null)
+  }
+
+  const order = mySlot === 1 ? [1, 0] : [0, 1]
+  return (
+    <div className="modal" onClick={onClose}>
+      <div className="card sheet" onClick={(e) => e.stopPropagation()}>
+        <h3>Botones iTag</h3>
+        <p className="muted small">
+          Asigna un iTag a cada jugador. Puedes conectar los dos en este teléfono, o cada jugador el suyo en su
+          propio teléfono: los puntos se sincronizan en vivo.
+        </p>
+        {!bleSupported && (
+          <p className="warn">Bluetooth no disponible aquí. iPhone: app nativa o navegador Bluefy · Android: Chrome.</p>
+        )}
+        {order.map((slot) => {
+          const s = slots[slot]
+          return (
+            <div key={slot} className="row">
+              <span>
+                <b>{names[slot]}</b>{slot === mySlot && <span className="muted"> (tú)</span>}<br />
+                <span className={`small ${s?.status === 'connected' ? 'ok' : 'muted'}`}>
+                  {s ? `${s.name} · ${{ connected: 'conectado', connecting: 'conectando…', lost: 'desconectado' }[s.status]}` : 'Sin iTag'}
+                </span>
+              </span>
+              <span className="actions">
+                {s?.status === 'connected' && <button className="btn ghost sm" onClick={() => beepItag(slot)}>🔔</button>}
+                {s ? (
+                  <>
+                    {s.status === 'lost' && <button className="btn sm" onClick={() => link(slot)}>Reconectar</button>}
+                    <button className="btn ghost sm" onClick={() => disconnectItag(slot)}>Quitar</button>
+                  </>
+                ) : (
+                  <button className="btn primary sm" disabled={!bleSupported || busy !== null} onClick={() => link(slot)}>
+                    {busy === slot ? 'Buscando…' : 'Vincular'}
+                  </button>
+                )}
+              </span>
+            </div>
+          )
+        })}
+        {err && <p className="err small">{err}</p>}
+        <div className="legend small">
+          <div><b>1 clic</b> → suma punto</div>
+          <div><b>2 clics</b> → devuelve el último punto</div>
+          <div><b>Mantener / 3 clics</b> → borra el marcador</div>
+          <div className="muted">En pantalla: toca, doble toque o mantén presionada la mitad de cada jugador.</div>
+        </div>
+        <label className="inline small">
+          <input type="checkbox" checked={autoSpeak} onChange={(e) => setAutoSpeak(e.target.checked)} />
+          Anunciar el marcador en voz alta
+        </label>
+        <p className="muted small">📺 Para verlo en la TV usa “Duplicar pantalla” (Android / Chromecast) o “Duplicar
+          pantalla” en AirPlay (iPhone) y pulsa ⛶.</p>
+        <button className="btn block" onClick={onClose}>Listo</button>
+      </div>
+    </div>
+  )
+}
+
+function Winner({ match, game, names, onExit }) {
+  const w = match.winner_slot
+  return (
+    <div className="modal winner">
+      <div className="card sheet center-text">
+        <div className="trophy">🏆</div>
+        {w === null || w === undefined ? <h2>¡Empate!</h2> : <><p className="muted">Ganador</p><h2>{names[w]}</h2></>}
+        <table className="sets big">
+          <tbody>
+            {[0, 1].map((p) => (
+              <tr key={p} className={w === p ? 'win' : ''}>
+                <td className="nm">{names[p]}</td>
+                {game.setLog.map((s, i) => <td key={i}>{s[p]}</td>)}
+                {(game.games[0] + game.games[1] > 0 || game.points[0] + game.points[1] > 0) && (
+                  <td className="cur">{match.mode === 'tennis' ? game.games[p] : game.points[p]}</td>
+                )}
+                <td className="tot">{game.sets[p]}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        <button className="btn primary block" onClick={onExit}>Volver al inicio</button>
+      </div>
+    </div>
+  )
+}
