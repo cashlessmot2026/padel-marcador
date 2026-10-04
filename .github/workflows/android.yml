@@ -1,0 +1,32 @@
+name: App Android (APK)
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency: { group: android-apk, cancel-in-progress: true }
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 21 }
+      - run: npm ci
+      - run: npm run build
+      - run: npx cap sync android
+      - name: Compilar APK
+        working-directory: android
+        run: chmod +x gradlew && ./gradlew assembleDebug --no-daemon
+      - run: cp android/app/build/outputs/apk/debug/app-debug.apk itag-score.apk
+      - name: Publicar en "android-latest"
+        env: { GH_TOKEN: '${{ github.token }}' }
+        run: |
+          gh release delete android-latest --yes --cleanup-tag || true
+          gh release create android-latest itag-score.apk \
+            --target "$GITHUB_SHA" \
+            --title "iTag Score · App Android" \
+            --notes "Descarga **itag-score.apk** en tu teléfono Android y ábrelo para instalar (permite instalar apps de origen desconocido). Compilado desde ${GITHUB_SHA::7}."

@@ -247,7 +247,13 @@ const KEY_NAMES = {
   ArrowLeft: 'Flecha ←', ArrowRight: 'Flecha →', PageUp: 'Pág ↑', PageDown: 'Pág ↓', MediaPlayPause: 'Play/Pausa',
   MediaTrackNext: 'Siguiente', MediaTrackPrevious: 'Anterior',
 }
-const keyId = (e) => (e.code && e.code !== 'Unidentified' ? e.code : e.key)
+const keyId = (e) => {
+  if (e.code && e.code !== 'Unidentified') return e.code
+  if (e.key && e.key !== 'Unidentified') return e.key
+  return `kc${e.keyCode}` // algunos botones solo traen el código numérico
+}
+const APK_URL = 'https://github.com/cashlessmot2026/padel-marcador/releases/download/android-latest/itag-score.apk'
+const isAndroidWeb = !isNative && typeof navigator !== 'undefined' && /android/i.test(navigator.userAgent)
 const keyLabel = (id) => KEY_NAMES[id] ?? id.replace(/^Key/, '').replace(/^Digit/, '')
 
 const selfie = {
@@ -452,7 +458,10 @@ async function copyText(text) {
   }
 }
 
-const REDIRECT_URL = typeof window !== 'undefined' ? window.location.origin + window.location.pathname : undefined
+const WEB_URL = 'https://cashlessmot2026.github.io/padel-marcador/'
+// En la app nativa los enlaces de los correos abren la web publicada
+const REDIRECT_URL = isNative ? WEB_URL
+  : typeof window !== 'undefined' ? window.location.origin + window.location.pathname : undefined
 
 // Proveedores conocidos: solo se muestran los que estén activos en Supabase
 const PROVIDERS = {
@@ -1144,6 +1153,15 @@ function ItagSetup({ names, mySlot, slots, keys, pulse, autoSpeak, setAutoSpeak,
   // Al cerrar, deja de esperar un botón selfie
   const close = () => { if (selfie.learning !== null) { selfie.learning = null; selfie.emit() } onClose() }
 
+  // Si a los 6 s no llegó ninguna tecla, casi seguro el botón solo envía "subir volumen"
+  const [noKey, setNoKey] = useState(false)
+  useEffect(() => {
+    if (keys.learning === null) return
+    setNoKey(false)
+    const t = setTimeout(() => setNoKey(true), 6000)
+    return () => clearTimeout(t)
+  }, [keys.learning])
+
   const order = mySlot === 1 ? [1, 0] : [0, 1]
   const status = { connected: 'conectado', connecting: 'conectando…', lost: 'desconectado' }
   const sameKey = keys.keys[0] && keys.keys[0] === keys.keys[1]
@@ -1215,7 +1233,20 @@ function ItagSetup({ names, mySlot, slots, keys, pulse, autoSpeak, setAutoSpeak,
         })}
 
         {err && <p className="err small">{err}</p>}
-        {sameKey && <p className="warn small">Los dos jugadores tienen la misma tecla.</p>}
+        {keys.learning !== null && noKey && (
+          <div className="warn small">
+            <b>No llegó ninguna pulsación.</b> Revisa que el botón selfie esté emparejado en <i>Ajustes → Bluetooth</i>
+            y prueba el otro botón (el marcado “Android”).
+            {!isNative && (
+              <> Si tu botón solo tiene uno, envía “subir volumen”, y el navegador no puede leerlo:
+                {isAndroidWeb
+                  ? <> instala la <a href={APK_URL}><b>app Android (APK)</b></a>, que sí lo lee.</>
+                  : <> en Android instala la app (APK); en iPhone hace falta la app nativa compilada en Xcode.</>}
+              </>
+            )}
+          </div>
+        )}
+        {sameKey &&<p className="warn small">Los dos jugadores tienen la misma tecla.</p>}
 
         <details className="help small">
           <summary>¿Cómo conecto mi botón?</summary>
@@ -1224,7 +1255,8 @@ function ItagSetup({ names, mySlot, slots, keys, pulse, autoSpeak, setAutoSpeak,
             AirTag, SmartTag ni Tile, porque sus marcas los bloquean.</p>
           <p><b>Botón selfie:</b> primero emparéjalo en los <i>Ajustes → Bluetooth</i> del teléfono. Luego pulsa
             <i> Asignar</i> y presiona el botón. En el navegador usa el botón <b>“Android”</b> (envía Enter). El botón
-            “iOS” (subir volumen) solo funciona en la app instalada desde Android Studio o Xcode.</p>
+            “iOS” (subir volumen) solo funciona en la app nativa: en Android descarga la{' '}
+            <a href={APK_URL}>app Android (APK)</a>; en iPhone hay que compilarla en Xcode.</p>
           <p><b>Dos botones selfie en el mismo teléfono</b> envían la misma tecla y no se pueden distinguir. Usa un
             botón selfie para un jugador y un iTag para el otro, o que cada jugador conecte su botón en su teléfono.</p>
         </details>
