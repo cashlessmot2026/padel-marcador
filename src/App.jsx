@@ -404,11 +404,14 @@ function translateAuthError(m = '') {
     [/user already registered/i, 'Ese correo ya tiene una cuenta'],
     [/password should be at least/i, 'La contraseña debe tener al menos 6 caracteres'],
     [/token has expired|otp.*(expired|invalid)|invalid.*token/i, 'Código inválido o vencido'],
-    [/rate limit|security purposes/i, 'Demasiados intentos. Espera un momento y vuelve a intentarlo'],
+    // Límite del servidor de Supabase (se configura en el panel, no en la app)
+    [/after (\d+) seconds?/i, (s) => `Supabase pide esperar ${s.match(/after (\d+)/i)[1]} s antes de enviar otro correo`],
+    [/rate limit/i, 'Supabase limitó los envíos de correo. Intenta más tarde o sube el límite en Supabase'],
     [/provider is not enabled/i, 'Ese proveedor no está activado'],
     [/database error saving new user/i, 'No se pudo crear el usuario (¿ese usuario ya existe?)'],
   ]
-  return map.find(([r]) => r.test(m))?.[1] ?? m
+  const hit = map.find(([r]) => r.test(m))?.[1]
+  return typeof hit === 'function' ? hit(m) : hit ?? m
 }
 
 /* ─────────────── Login / Registro / Recuperar ─────────────── */
