@@ -19,16 +19,30 @@ drop policy if exists "profiles_update_own" on public.profiles;
 create policy "profiles_update_own" on public.profiles
   for update to authenticated using (auth.uid() = id);
 
--- Crea el perfil automáticamente al registrarse
+-- Crea el perfil automáticamente al registrarse (correo o proveedores: Google, Apple, GitHub…)
 create or replace function public.handle_new_user()
 returns trigger language plpgsql security definer set search_path = public as $$
+declare
+  m jsonb := coalesce(new.raw_user_meta_data, '{}'::jsonb);
+  base text;
+  uname text;
+  dname text;
 begin
-  insert into public.profiles (id, username, display_name)
-  values (
-    new.id,
-    lower(new.raw_user_meta_data->>'username'),
-    coalesce(nullif(new.raw_user_meta_data->>'display_name', ''), new.raw_user_meta_data->>'username')
-  );
+  base := lower(coalesce(
+    nullif(m->>'username', ''), nullif(m->>'user_name', ''), nullif(m->>'preferred_username', ''),
+    split_part(coalesce(new.email, ''), '@', 1), 'jugador'
+  ));
+  base := left(regexp_replace(base, '[^a-z0-9_]', '', 'g'), 15);
+  if length(base) < 3 then base := 'jugador'; end if;
+  uname := base;
+  -- Si el usuario ya existe (p. ej. entró con Google), se le añade un número
+  while exists (select 1 from public.profiles where username = uname) loop
+    uname := base || (floor(random() * 9000) + 1000)::int;
+  end loop;
+
+  dname := coalesce(nullif(m->>'display_name', ''), nullif(m->>'full_name', ''), nullif(m->>'name', ''), uname);
+
+  insert into public.profiles (id, username, display_name) values (new.id, uname, dname);
   return new;
 end $$;
 

@@ -32,11 +32,28 @@ con usuarios, invitaciones y marcador sincronizado en tiempo real con **Supabase
 
 Los iTag avisan cada pulsación con una notificación en el servicio `0xFFE0` y la característica `0xFFE1`.
 
+## Login
+
+- **Registro con correo**: nombre, usuario (se valida en vivo contra la base de datos), correo y contraseña con medidor de seguridad.
+  Supabase Auth guarda el usuario en `auth.users` y un trigger crea su perfil en `public.profiles`.
+- **Proveedores (Google, Apple, GitHub, Facebook, Microsoft…)**: los botones aparecen solos para cada
+  proveedor que actives en Supabase. A esos usuarios se les crea un nombre de usuario automáticamente.
+- **Recuperar contraseña**: el usuario escribe su correo y recibe un enlace (o código). Al validarlo, la app
+  genera una **clave nueva** y la muestra 5 segundos en una ventana con botón para copiarla.
+  La clave anterior no se puede mostrar porque Supabase solo guarda el hash.
+
 ## 1. Configurar Supabase (una sola vez)
 
-1. Abre tu proyecto → **SQL Editor** → pega [`supabase/schema.sql`](supabase/schema.sql) → **Run**.
-2. Para un registro instantáneo: **Authentication → Sign In / Providers → Email** → desactiva **Confirm email**.
-   (Si lo dejas activado, cada jugador debe confirmar su correo antes de entrar.)
+1. **SQL Editor**: pega [`supabase/schema.sql`](supabase/schema.sql) y pulsa **Run**. Puedes volver a ejecutarlo sin perder datos.
+2. **Authentication → Sign In / Providers → Email**: desactiva **Confirm email** si quieres que el registro sea instantáneo.
+3. **Authentication → URL Configuration**:
+   - Site URL: `https://cashlessmot2026.github.io/padel-marcador/`
+   - Redirect URLs: añade esa misma URL y `http://localhost:5173/`
+   (lo usan el enlace de recuperación y los proveedores).
+4. *(Opcional, recuperar con código)* **Authentication → Emails → Reset Password**: añade `{{ .Token }}` a la
+   plantilla para que el correo también incluya un código que se puede escribir en la app.
+5. *(Opcional, proveedores)* **Authentication → Sign In / Providers**: activa Google, Apple, GitHub, etc., con
+   su Client ID y Secret. Los botones aparecen solos en el login.
 
 La URL y la anon key ya están en el código. Si quieres cambiarlas, copia `.env.example` a `.env`.
 La anon key es pública por diseño; la seguridad la dan las políticas RLS del esquema.

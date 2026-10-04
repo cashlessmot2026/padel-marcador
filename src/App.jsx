@@ -249,89 +249,374 @@ export default function App() {
   const [session, setSession] = useState(undefined)
   const [profile, setProfile] = useState(null)
   const [matchId, setMatchId] = useState(null)
+  // En desarrollo, abre la ventana de la clave con #demo-clave para revisarla
+  const [newPassword, setNewPassword] = useState(() =>
+    import.meta.env.DEV && window.location.hash === '#demo-clave' ? generatePassword() : null)
+  const [recoveryError, setRecoveryError] = useState(null)
 
-  useEffect(() => {
-    supabase.auth.getSession().then(({ data }) => setSession(data.session))
-    const { data } = supabase.auth.onAuthStateChange((_e, s) => setSession(s))
-    return () => data.subscription.unsubscribe()
+  // Tras validar la recuperación por correo: genera una clave nueva y la muestra 5 s
+  const revealing = useRef(false)
+  const issueNewPassword = useCallback(async () => {
+    if (revealing.current) return
+    revealing.current = true
+    const pwd = generatePassword()
+    const { error } = await supabase.auth.updateUser({ password: pwd })
+    revealing.current = false
+    if (error) return setRecoveryError(translateAuthError(error.message))
+    setNewPassword(pwd)
   }, [])
 
   useEffect(() => {
+    supabase.auth.getSession().then(({ data }) => setSession(data.session))
+    const { data } = supabase.auth.onAuthStateChange((event, s) => {
+      setSession(s)
+      // El usuario llegó desde el enlace "recuperar contraseña" del correo
+      if (event === 'PASSWORD_RECOVERY') setTimeout(issueNewPassword, 0)
+    })
+    return () => data.subscription.unsubscribe()
+  }, [issueNewPassword])
+
+  useEffect(() => {
     if (!session) { setProfile(null); return }
+    const meta = session.user.user_metadata ?? {}
     supabase.from('profiles').select('*').eq('id', session.user.id).single()
       .then(({ data }) => setProfile(data ?? {
         id: session.user.id,
-        username: session.user.user_metadata?.username ?? '',
-        display_name: session.user.user_metadata?.display_name ?? 'Jugador',
+        username: meta.username ?? meta.user_name ?? session.user.email?.split('@')[0] ?? '',
+        display_name: meta.display_name ?? meta.full_name ?? meta.name ?? 'Jugador',
       }))
   }, [session])
 
+  const overlays = (
+    <>
+      {newPassword && <PasswordReveal password={newPassword} onClose={() => setNewPassword(null)} />}
+      {recoveryError && (
+        <div className="modal" onClick={() => setRecoveryError(null)}>
+          <div className="card sheet center-text"><p className="err">{recoveryError}</p>
+            <button className="btn block">Cerrar</button></div>
+        </div>
+      )}
+    </>
+  )
+
   if (session === undefined) return <div className="center muted">Cargando…</div>
-  if (!session) return <Auth />
+  if (!session) return <><Auth onRecovered={issueNewPassword} />{overlays}</>
   if (!profile) return <div className="center muted">Cargando perfil…</div>
-  if (matchId) return <Match id={matchId} me={profile} onExit={() => setMatchId(null)} />
-  return <Home me={profile} onOpen={setMatchId} />
+  return (
+    <>
+      {matchId
+        ? <Match id={matchId} me={profile} onExit={() => setMatchId(null)} />
+        : <Home me={profile} onOpen={setMatchId} />}
+      {overlays}
+    </>
+  )
 }
 
-/* ─────────────── Registro rápido / Entrar ─────────────── */
-function Auth() {
-  const [mode, setMode] = useState('signup')
-  const [f, setF] = useState({ name: '', username: '', email: '', password: '' })
+function generatePassword(len = 12) {
+  const sets = ['ABCDEFGHJKLMNPQRSTUVWXYZ', 'abcdefghijkmnpqrstuvwxyz', '23456789', '!@#$%*?']
+  const all = sets.join('')
+  const rnd = (n) => crypto.getRandomValues(new Uint32Array(1))[0] % n
+  const chars = sets.map((s) => s[rnd(s.length)])
+  while (chars.length < len) chars.push(all[rnd(all.length)])
+  for (let i = chars.length - 1; i > 0; i--) {
+    const j = rnd(i + 1)
+    ;[chars[i], chars[j]] = [chars[j], chars[i]]
+  }
+  return chars.join('')
+}
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text)
+    return true
+  } catch {
+    const t = Object.assign(document.createElement('textarea'), { value: text })
+    document.body.appendChild(t)
+    t.select()
+    const ok = document.execCommand('copy')
+    t.remove()
+    return ok
+  }
+}
+
+const REDIRECT_URL = typeof window !== 'undefined' ? window.location.origin + window.location.pathname : undefined
+
+// Proveedores conocidos: solo se muestran los que estén activos en Supabase
+const PROVIDERS = {
+  google: { label: 'Google', icon: <svg viewBox="0 0 24 24"><path fill="#EA4335" d="M12 10.2v3.9h5.5c-.2 1.3-1.6 3.8-5.5 3.8-3.3 0-6-2.7-6-6.1s2.7-6.1 6-6.1c1.9 0 3.1.8 3.8 1.5l2.6-2.5C16.8 3.2 14.6 2.2 12 2.2 6.6 2.2 2.2 6.6 2.2 12s4.4 9.8 9.8 9.8c5.7 0 9.4-4 9.4-9.6 0-.6-.1-1.1-.2-1.6H12z" /></svg> },
+  apple: { label: 'Apple', icon: <svg viewBox="0 0 24 24"><path fill="currentColor" d="M16.4 12.6c0-2.6 2.1-3.8 2.2-3.9-1.2-1.8-3.1-2-3.7-2-1.6-.2-3.1.9-3.9.9-.8 0-2-.9-3.4-.9-1.7 0-3.3 1-4.2 2.6-1.8 3.1-.5 7.7 1.3 10.2.8 1.2 1.8 2.6 3.1 2.5 1.3-.1 1.7-.8 3.2-.8s1.9.8 3.2.8c1.3 0 2.2-1.2 3-2.4.9-1.4 1.3-2.7 1.3-2.8 0 0-2.6-1-2.6-4.1zM13.9 5c.7-.8 1.2-2 1-3.1-1 0-2.2.7-2.9 1.5-.6.7-1.2 1.9-1 3 1.1.1 2.2-.6 2.9-1.4z" /></svg> },
+  github: { label: 'GitHub', icon: <svg viewBox="0 0 24 24"><path fill="currentColor" d="M12 .5C5.7.5.5 5.7.5 12c0 5.1 3.3 9.4 7.9 10.9.6.1.8-.3.8-.6v-2c-3.2.7-3.9-1.5-3.9-1.5-.5-1.3-1.3-1.7-1.3-1.7-1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1 1.8 2.8 1.3 3.5 1 .1-.8.4-1.3.7-1.6-2.6-.3-5.3-1.3-5.3-5.7 0-1.3.5-2.3 1.2-3.1-.1-.3-.5-1.5.1-3.1 0 0 1-.3 3.3 1.2a11.5 11.5 0 0 1 6 0C17.3 4.7 18.3 5 18.3 5c.6 1.6.2 2.8.1 3.1.8.8 1.2 1.9 1.2 3.1 0 4.4-2.7 5.4-5.3 5.7.4.4.8 1.1.8 2.2v3.3c0 .3.2.7.8.6A11.5 11.5 0 0 0 23.5 12C23.5 5.7 18.3.5 12 .5z" /></svg> },
+  facebook: { label: 'Facebook', icon: <svg viewBox="0 0 24 24"><path fill="#1877F2" d="M24 12a12 12 0 1 0-13.9 11.9v-8.4H7.1V12h3V9.4c0-3 1.8-4.7 4.5-4.7 1.3 0 2.7.2 2.7.2v3h-1.5c-1.5 0-2 .9-2 1.9V12h3.4l-.5 3.5h-2.9v8.4A12 12 0 0 0 24 12z" /></svg> },
+  azure: { label: 'Microsoft', icon: <svg viewBox="0 0 24 24"><path fill="#F25022" d="M1 1h10v10H1z" /><path fill="#7FBA00" d="M13 1h10v10H13z" /><path fill="#00A4EF" d="M1 13h10v10H1z" /><path fill="#FFB900" d="M13 13h10v10H13z" /></svg> },
+  discord: { label: 'Discord' },
+  twitter: { label: 'X' },
+  gitlab: { label: 'GitLab' },
+  spotify: { label: 'Spotify' },
+  twitch: { label: 'Twitch' },
+  linkedin_oidc: { label: 'LinkedIn' },
+  slack_oidc: { label: 'Slack' },
+  notion: { label: 'Notion' },
+}
+
+function useEnabledProviders() {
+  const [list, setList] = useState([])
+  useEffect(() => {
+    fetch(`${SUPABASE_URL}/auth/v1/settings`, { headers: { apikey: SUPABASE_ANON_KEY } })
+      .then((r) => r.json())
+      .then((s) => setList(Object.keys(PROVIDERS).filter((k) => s?.external?.[k])))
+      .catch(() => {})
+  }, [])
+  return list
+}
+
+function passwordScore(p) {
+  let s = 0
+  if (p.length >= 8) s++
+  if (p.length >= 12) s++
+  if (/[A-Z]/.test(p) && /[a-z]/.test(p)) s++
+  if (/\d/.test(p)) s++
+  if (/[^A-Za-z0-9]/.test(p)) s++
+  return Math.min(4, s)
+}
+
+function Field({ icon, label, type = 'text', value, onChange, hint, hintOk, ...rest }) {
+  const [show, setShow] = useState(false)
+  const isPwd = type === 'password'
+  return (
+    <label className={`field ${value ? 'filled' : ''}`}>
+      <span className="ficon" aria-hidden>{icon}</span>
+      <input type={isPwd && show ? 'text' : type} value={value} onChange={onChange} placeholder=" " {...rest} />
+      <span className="flabel">{label}</span>
+      {isPwd && (
+        <button type="button" className="eye" onClick={() => setShow(!show)} aria-label={show ? 'Ocultar clave' : 'Mostrar clave'}>
+          {show ? '🙈' : '👁'}
+        </button>
+      )}
+      {hint && <span className={`fhint ${hintOk === true ? 'ok' : hintOk === false ? 'err' : ''}`}>{hint}</span>}
+    </label>
+  )
+}
+
+function translateAuthError(m = '') {
+  const map = [
+    [/invalid login credentials/i, 'Correo o contraseña incorrectos'],
+    [/email not confirmed/i, 'Confirma tu correo antes de entrar'],
+    [/user already registered/i, 'Ese correo ya tiene una cuenta'],
+    [/password should be at least/i, 'La contraseña debe tener al menos 6 caracteres'],
+    [/token has expired|otp.*(expired|invalid)|invalid.*token/i, 'Código inválido o vencido'],
+    [/rate limit|security purposes/i, 'Demasiados intentos. Espera un momento y vuelve a intentarlo'],
+    [/provider is not enabled/i, 'Ese proveedor no está activado'],
+    [/database error saving new user/i, 'No se pudo crear el usuario (¿ese usuario ya existe?)'],
+  ]
+  return map.find(([r]) => r.test(m))?.[1] ?? m
+}
+
+/* ─────────────── Login / Registro / Recuperar ─────────────── */
+function Auth({ onRecovered }) {
+  const [view, setView] = useState('login') // login | signup | forgot | code
+  const [f, setF] = useState({ name: '', username: '', email: '', password: '', code: '' })
   const [msg, setMsg] = useState(null)
   const [busy, setBusy] = useState(false)
-  const up = (k) => (e) => setF({ ...f, [k]: e.target.value })
+  const [shake, setShake] = useState(0)
+  const [userFree, setUserFree] = useState(null)
+  const providers = useEnabledProviders()
+  const up = (k) => (e) => setF((x) => ({ ...x, [k]: e.target.value }))
+  const go = (v) => { setView(v); setMsg(null) }
 
-  async function submit(e) {
-    e.preventDefault()
+  // Disponibilidad del usuario en vivo, validada contra la base de datos
+  useEffect(() => {
+    if (view !== 'signup') return
+    const u = f.username.trim().toLowerCase()
+    if (!/^[a-z0-9_]{3,20}$/.test(u)) { setUserFree(u ? 'invalid' : null); return }
+    setUserFree('checking')
+    const t = setTimeout(async () => {
+      const { data, error } = await supabase.rpc('username_available', { u })
+      setUserFree(error ? null : data ? 'free' : 'taken')
+    }, 350)
+    return () => clearTimeout(t)
+  }, [f.username, view])
+
+  async function run(fn) {
     setBusy(true)
     setMsg(null)
     try {
-      if (mode === 'signup') {
-        const username = f.username.trim().toLowerCase()
-        if (!/^[a-z0-9_]{3,20}$/.test(username)) throw new Error('Usuario: 3-20 letras minúsculas, números o _')
-        const { data: free, error: e1 } = await supabase.rpc('username_available', { u: username })
-        if (e1) throw e1
-        if (!free) throw new Error('Ese usuario ya existe')
-        const { data, error } = await supabase.auth.signUp({
-          email: f.email.trim(),
-          password: f.password,
-          options: { data: { username, display_name: f.name.trim() || username } },
-        })
-        if (error) throw error
-        if (!data.session) setMsg({ ok: true, text: 'Cuenta creada. Revisa tu correo para confirmar y luego entra.' })
-      } else {
-        const { error } = await supabase.auth.signInWithPassword({ email: f.email.trim(), password: f.password })
-        if (error) throw error
-      }
+      await fn()
     } catch (err) {
-      setMsg({ ok: false, text: err.message })
+      setMsg({ ok: false, text: translateAuthError(err.message) })
+      setShake((n) => n + 1)
     } finally {
       setBusy(false)
     }
   }
 
+  const submit = (e) => {
+    e.preventDefault()
+    run(async () => {
+      const email = f.email.trim()
+      if (view === 'login') {
+        const { error } = await supabase.auth.signInWithPassword({ email, password: f.password })
+        if (error) throw error
+      } else if (view === 'signup') {
+        const username = f.username.trim().toLowerCase()
+        if (userFree === 'invalid') throw new Error('Usuario: 3-20 letras minúsculas, números o _')
+        if (userFree === 'taken') throw new Error('Ese usuario ya existe')
+        const { data, error } = await supabase.auth.signUp({
+          email,
+          password: f.password,
+          options: { data: { username, display_name: f.name.trim() || username }, emailRedirectTo: REDIRECT_URL },
+        })
+        if (error) throw error
+        if (!data.session) {
+          setView('login')
+          setMsg({ ok: true, text: '✉️ Te enviamos un correo para confirmar tu cuenta.' })
+        }
+      } else if (view === 'forgot') {
+        const { error } = await supabase.auth.resetPasswordForEmail(email, { redirectTo: REDIRECT_URL })
+        if (error) throw error
+        setView('code')
+        setMsg({ ok: true, text: `✉️ Enviamos un correo a ${email}. Abre el enlace o escribe aquí el código.` })
+      } else if (view === 'code') {
+        const { error } = await supabase.auth.verifyOtp({ email, token: f.code.trim(), type: 'recovery' })
+        if (error) throw error
+        await onRecovered()
+      }
+    })
+  }
+
+  const oauth = (provider) => run(async () => {
+    const { error } = await supabase.auth.signInWithOAuth({ provider, options: { redirectTo: REDIRECT_URL } })
+    if (error) throw error
+  })
+
+  const score = passwordScore(f.password)
+  const titles = {
+    login: ['Bienvenido de vuelta', 'Entra para llevar el marcador'],
+    signup: ['Crea tu cuenta', 'En menos de 30 segundos'],
+    forgot: ['¿Olvidaste tu clave?', 'Te ayudamos a recuperarla con tu correo'],
+    code: ['Revisa tu correo', 'Valida que eres tú'],
+  }
+  const cta = {
+    login: 'Entrar', signup: 'Crear cuenta', forgot: 'Enviar correo de recuperación', code: 'Validar y ver mi nueva clave',
+  }
+  const hints = { invalid: '3-20 letras minúsculas, números o _', checking: 'Comprobando…', free: '✓ Disponible', taken: '✗ Ya está en uso' }
+
   return (
-    <div className="auth">
-      <div className="brand"><span className="ball" /> iTag Score</div>
-      <p className="muted">Marcador en vivo controlado con botones iTag</p>
-      <div className="tabs">
-        <button className={mode === 'signup' ? 'on' : ''} onClick={() => setMode('signup')}>Registro rápido</button>
-        <button className={mode === 'login' ? 'on' : ''} onClick={() => setMode('login')}>Entrar</button>
-      </div>
-      <form onSubmit={submit} className="card form">
-        {mode === 'signup' && (
-          <>
-            <input placeholder="Tu nombre" value={f.name} onChange={up('name')} required />
-            <input placeholder="Usuario (para que te encuentren)" value={f.username} onChange={up('username')}
-              autoCapitalize="none" required />
-          </>
+    <div className="auth2">
+      <div className="blobs" aria-hidden><i /><i /><i /></div>
+      <div className={`auth-card ${shake ? 'shake' : ''}`} key={shake}>
+        <div className="brand"><span className="ball spin" /> iTag Score</div>
+
+        {(view === 'login' || view === 'signup') && (
+          <div className="switch" data-pos={view === 'signup' ? 1 : 0}>
+            <span className="pill-bg" />
+            <button type="button" className={view === 'login' ? 'on' : ''} onClick={() => go('login')}>Entrar</button>
+            <button type="button" className={view === 'signup' ? 'on' : ''} onClick={() => go('signup')}>Registrarse</button>
+          </div>
         )}
-        <input type="email" placeholder="Correo" value={f.email} onChange={up('email')} autoComplete="email" required />
-        <input type="password" placeholder="Contraseña (mín. 6)" value={f.password} onChange={up('password')}
-          minLength={6} autoComplete={mode === 'signup' ? 'new-password' : 'current-password'} required />
-        <button className="btn primary" disabled={busy}>{busy ? '…' : mode === 'signup' ? 'Crear cuenta' : 'Entrar'}</button>
-        {msg && <p className={msg.ok ? 'ok' : 'err'}>{msg.text}</p>}
-      </form>
+
+        <div className="view" key={view}>
+          <h1>{titles[view][0]}</h1>
+          <p className="muted sub">{titles[view][1]}</p>
+
+          <form onSubmit={submit} className="fields">
+            {view === 'signup' && (
+              <>
+                <Field icon="👤" label="Tu nombre" value={f.name} onChange={up('name')} autoComplete="name" required />
+                <Field icon="@" label="Usuario" value={f.username} onChange={up('username')} autoCapitalize="none"
+                  autoComplete="username" required hint={hints[userFree]}
+                  hintOk={userFree === 'free' ? true : userFree === 'taken' || userFree === 'invalid' ? false : undefined} />
+              </>
+            )}
+
+            {view !== 'code' && (
+              <Field icon="✉️" label="Correo electrónico" type="email" value={f.email} onChange={up('email')}
+                autoComplete="email" inputMode="email" required />
+            )}
+
+            {(view === 'login' || view === 'signup') && (
+              <Field icon="🔒" label="Contraseña" type="password" value={f.password} onChange={up('password')}
+                minLength={6} required autoComplete={view === 'signup' ? 'new-password' : 'current-password'} />
+            )}
+
+            {view === 'signup' && f.password && (
+              <div className="strength" data-score={score}>
+                <span /><span /><span /><span />
+                <em>{['Muy débil', 'Débil', 'Aceptable', 'Buena', 'Excelente'][score]}</em>
+              </div>
+            )}
+
+            {view === 'code' && (
+              <Field icon="🔑" label="Código del correo" value={f.code} onChange={up('code')} inputMode="numeric"
+                autoComplete="one-time-code" pattern="[0-9]{6,10}" required />
+            )}
+
+            {view === 'login' && (
+              <button type="button" className="linkbtn right" onClick={() => go('forgot')}>¿Olvidaste tu contraseña?</button>
+            )}
+
+            {msg && <p className={`msg ${msg.ok ? 'ok' : 'err'}`}>{msg.text}</p>}
+
+            <button className="cta" disabled={busy}>{busy ? <span className="spinner" /> : cta[view]}</button>
+          </form>
+
+          {(view === 'forgot' || view === 'code') && (
+            <button type="button" className="linkbtn" onClick={() => go('login')}>← Volver a entrar</button>
+          )}
+
+          {(view === 'login' || view === 'signup') && providers.length > 0 && (
+            <>
+              <div className="divider"><span>o continúa con</span></div>
+              <div className="providers">
+                {providers.map((p) => (
+                  <button key={p} type="button" className="prov" onClick={() => oauth(p)} disabled={busy}>
+                    {PROVIDERS[p].icon ?? <b>{PROVIDERS[p].label[0]}</b>}
+                    <span>{PROVIDERS[p].label}</span>
+                  </button>
+                ))}
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+/* Ventana emergente: nueva clave visible 5 s con botón para copiar */
+function PasswordReveal({ password, onClose }) {
+  const SECONDS = 5
+  const [left, setLeft] = useState(SECONDS)
+  const [copied, setCopied] = useState(false)
+  const closeRef = useRef(onClose)
+  closeRef.current = onClose
+
+  useEffect(() => {
+    const started = Date.now()
+    const t = setInterval(() => {
+      const l = SECONDS - (Date.now() - started) / 1000
+      if (l <= 0) {
+        clearInterval(t)
+        closeRef.current()
+      } else setLeft(l)
+    }, 100)
+    return () => clearInterval(t)
+  }, [])
+
+  return (
+    <div className="modal reveal-bg">
+      <div className="reveal" role="dialog" aria-label="Tu nueva clave de acceso">
+        <svg className="ring" viewBox="0 0 44 44" aria-hidden>
+          <circle cx="22" cy="22" r="20" />
+          <circle cx="22" cy="22" r="20" className="prog" style={{ strokeDashoffset: 125.66 * (1 - left / SECONDS) }} />
+          <text x="22" y="27">{Math.ceil(left)}</text>
+        </svg>
+        <h2>Tu nueva clave de acceso</h2>
+        <p className="muted small">Se ocultará en {Math.ceil(left)} s · ya iniciaste sesión con ella</p>
+        <code className="pwd">{password}</code>
+        <button className={`cta ${copied ? 'done' : ''}`} onClick={async () => setCopied(await copyText(password))}>
+          {copied ? '✓ Copiada al portapapeles' : '📋 Copiar clave'}
+        </button>
+      </div>
     </div>
   )
 }
