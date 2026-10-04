@@ -1,10 +1,20 @@
 {
+  "id": "./",
   "name": "iTag Score",
   "short_name": "iTag Score",
+  "description": "Marcador en vivo controlado con botones Bluetooth iTag",
+  "lang": "es",
   "start_url": "./",
-  "display": "fullscreen",
+  "scope": "./",
+  "display": "standalone",
+  "display_override": ["fullscreen", "standalone"],
   "orientation": "any",
   "background_color": "#0b1f3a",
   "theme_color": "#0b1f3a",
-  "icons": [{ "src": "favicon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }]
+  "categories": ["sports"],
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icons/maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
 }
