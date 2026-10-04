@@ -635,29 +635,62 @@ function Home({ me, onOpen }) {
   const [matches, setMatches] = useState([])
   const [err, setErr] = useState(null)
 
+  const [newInvite, setNewInvite] = useState(false)
+  const seenInvites = useRef(null)
+  const waitingIds = useRef(new Set())
+
   const load = useCallback(async () => {
-    const { data } = await supabase.from('matches').select('*')
+    const { data, error } = await supabase.from('matches').select('*')
       .or(`host_id.eq.${me.id},player1_id.eq.${me.id},player2_id.eq.${me.id}`)
       .order('created_at', { ascending: false }).limit(40)
-    setMatches(data ?? [])
-  }, [me.id])
+    if (error) return
+    const rows = data ?? []
+    setMatches(rows)
 
+    // Aviso de invitación nueva (sonido + vibración)
+    const inv = rows.filter((m) => m.status === 'invited' && m.player2_id === me.id).map((m) => m.id)
+    if (seenInvites.current && inv.some((id) => !seenInvites.current.has(id))) {
+      blip(990); setTimeout(() => blip(1320), 160)
+      navigator.vibrate?.([120, 80, 120])
+      setNewInvite(true)
+    }
+    seenInvites.current = new Set(inv)
+
+    // Si el rival aceptó mi invitación, abro el partido
+    const accepted = rows.find((m) => waitingIds.current.has(m.id) && m.status === 'active')
+    waitingIds.current = new Set(rows.filter((m) => m.status === 'invited' && m.host_id === me.id).map((m) => m.id))
+    if (accepted) onOpen(accepted.id)
+  }, [me.id, onOpen])
+
+  // Tiempo real + revisión cada 5 s + al volver a la app (por si el tiempo real se corta)
   useEffect(() => {
     load()
-    const ch = supabase.channel(`home-${me.id}`)
+    const ch = supabase.channel(`home-${me.id}-${Math.random().toString(36).slice(2)}`)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'matches' }, load)
       .subscribe()
-    return () => { supabase.removeChannel(ch) }
+    const poll = setInterval(load, 5000)
+    const onFocus = () => document.visibilityState === 'visible' && load()
+    document.addEventListener('visibilitychange', onFocus)
+    window.addEventListener('focus', onFocus)
+    return () => {
+      clearInterval(poll)
+      document.removeEventListener('visibilitychange', onFocus)
+      window.removeEventListener('focus', onFocus)
+      supabase.removeChannel(ch)
+    }
   }, [load, me.id])
 
+  useEffect(() => { if (newInvite) { const t = setTimeout(() => setNewInvite(false), 4000); return () => clearTimeout(t) } }, [newInvite])
+
+  // Lista de jugadores registrados: todos, o filtrados por la búsqueda
   useEffect(() => {
     const term = q.trim().replace(/[^\p{L}\p{N}_ ]/gu, '')
-    if (term.length < 2) { setResults([]); return }
     const t = setTimeout(async () => {
-      const { data } = await supabase.from('profiles').select('id,username,display_name')
-        .or(`username.ilike.%${term}%,display_name.ilike.%${term}%`).neq('id', me.id).limit(10)
+      let query = supabase.from('profiles').select('id,username,display_name').neq('id', me.id)
+      if (term) query = query.or(`username.ilike.%${term}%,display_name.ilike.%${term}%`)
+      const { data } = await query.order('display_name').limit(200)
       setResults(data ?? [])
-    }, 250)
+    }, term ? 250 : 0)
     return () => clearTimeout(t)
   }, [q, me.id])
 
@@ -701,7 +734,7 @@ function Home({ me, onOpen }) {
       </header>
 
       {invites.length > 0 && (
-        <section className="card invite-card">
+        <section className={`card invite-card ${newInvite ? 'ping' : ''}`}>
           <h3>📨 Invitaciones</h3>
           {invites.map((m) => (
             <div key={m.id} className="row">
@@ -721,7 +754,10 @@ function Home({ me, onOpen }) {
           <>
             <input placeholder="Buscar jugador por nombre o @usuario" value={q} onChange={(e) => setQ(e.target.value)}
               autoCapitalize="none" />
-            <div className="results">
+            <p className="muted small count">
+              {q.trim() ? `${results.length} encontrado(s)` : `${results.length} jugador(es) registrado(s)`}
+            </p>
+            <div className="results players">
               {results.map((p) => (
                 <button key={p.id} className="result" onClick={() => setOpponent(p)}>
                   <span className="avatar">{p.display_name[0]?.toUpperCase()}</span>
@@ -729,7 +765,7 @@ function Home({ me, onOpen }) {
                   <span className="pill">Invitar</span>
                 </button>
               ))}
-              {q.trim().length >= 2 && !results.length && <p className="muted">Sin resultados</p>}
+              {!results.length && <p className="muted">{q.trim() ? 'Sin resultados' : 'Aún no hay otros jugadores'}</p>}
             </div>
             <div className="or">o juega aquí mismo con un amigo sin cuenta</div>
             <div className="inline">

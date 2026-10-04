@@ -87,3 +87,25 @@ do $$ begin
   alter publication supabase_realtime add table public.matches;
 exception when duplicate_object then null;
 end $$;
+
+insert into public.profiles (id, username, display_name)
+select u.id, x.base, coalesce(nullif(u.raw_user_meta_data->>'display_name', ''), nullif(u.raw_user_meta_data->>'full_name', ''), nullif(u.raw_user_meta_data->>'name', ''), x.base)
+from auth.users u
+cross join lateral (
+  select case when length(b) >= 3 then b else 'jugador' end as base
+  from (select left(regexp_replace(lower(coalesce(nullif(u.raw_user_meta_data->>'username', ''), split_part(coalesce(u.email, ''), '@', 1))), '[^a-z0-9_]', '', 'g'), 15) as b) s
+) x
+where not exists (select 1 from public.profiles p where p.id = u.id)
+on conflict do nothing;
+
+insert into public.profiles (id, username, display_name)
+select u.id, x.base || substr(md5(u.id::text), 1, 4), coalesce(nullif(u.raw_user_meta_data->>'display_name', ''), nullif(u.raw_user_meta_data->>'full_name', ''), nullif(u.raw_user_meta_data->>'name', ''), x.base)
+from auth.users u
+cross join lateral (
+  select case when length(b) >= 3 then b else 'jugador' end as base
+  from (select left(regexp_replace(lower(coalesce(nullif(u.raw_user_meta_data->>'username', ''), split_part(coalesce(u.email, ''), '@', 1))), '[^a-z0-9_]', '', 'g'), 15) as b) s
+) x
+where not exists (select 1 from public.profiles p where p.id = u.id)
+on conflict do nothing;
+
+update auth.users set email_confirmed_at = now() where email_confirmed_at is null;
