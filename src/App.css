@@ -310,3 +310,18 @@ input[type='number'] { width: 90px; }
 @media (prefers-reduced-motion: reduce) {
   .blobs i, .ball.spin, .auth-card, .view, .reveal { animation: none; }
 }
+
+/* ───────── botones de jugadores ───────── */
+.player-block { border: 1.5px solid var(--line); border-radius: 14px; padding: 10px 12px 2px; margin: 10px 0; transition: border-color 0.2s, background 0.2s; }
+.player-block.hit { border-color: var(--lime); background: #f6fdee; }
+.pb-head { display: flex; align-items: center; gap: 6px; }
+.hit-dot { margin-left: auto; color: var(--lime-dark); font-weight: 800; font-size: 0.8rem; animation: fadeOut 1.2s forwards; }
+@keyframes fadeOut { 0%, 60% { opacity: 1; } 100% { opacity: 0; } }
+.player-block .row:first-of-type { border-top: 1px solid var(--line); }
+.learning { color: var(--blue); font-weight: 800; animation: blink 1s ease-in-out infinite; }
+@keyframes blink { 50% { opacity: 0.4; } }
+.help { background: #f6f8fa; border-radius: 12px; padding: 10px 12px; margin: 10px 0; }
+.help summary { cursor: pointer; font-weight: 800; }
+.help p { margin: 8px 0 0; line-height: 1.45; }
+.flash { position: absolute; inset: 0; pointer-events: none; background: rgba(255, 255, 255, 0.55); animation: flash 0.35s ease-out forwards; }
+@keyframes flash { to { opacity: 0; } }

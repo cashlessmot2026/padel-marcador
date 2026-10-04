@@ -4,6 +4,7 @@ import { useCallback, useEffect, useReducer, useRef, useState, useSyncExternalSt
 import { createClient } from '@supabase/supabase-js'
 import { Capacitor } from '@capacitor/core'
 import { BleClient, numberToUUID, numbersToDataView } from '@capacitor-community/bluetooth-le'
+import { VolumeButtons } from '@capacitor-community/volume-buttons'
 import './App.css'
 
 /* ═════════════════════════ SUPABASE ═════════════════════════ */
@@ -123,18 +124,24 @@ function makeClickDecoder(onAction, wait = 380) {
   }
 }
 
-/* ═════════════════════════ BLUETOOTH iTAG ═════════════════════════ */
-const ITAG_SVC = numberToUUID(0xffe0)
+/* ═════════════════════════ BOTONES: iTAG · RASTREADORES BLE · BOTONES SELFIE ═════════════════════════ */
 const ITAG_BTN = numberToUUID(0xffe1)
 const ALERT_SVC = numberToUUID(0x1802)
 const LINK_LOSS_SVC = numberToUUID(0x1803)
 const ALERT_LEVEL = numberToUUID(0x2a06)
 const HOLD_MS = 900
 
+// Servicios donde los iTag y los rastreadores "anti-pérdida" genéricos avisan cuando se pulsa su botón.
+// En la web hay que declararlos todos de antemano: el navegador no deja leer los que no estén en la lista.
+const BUTTON_SERVICES = [0xffe0, 0xfff0, 0xffa0, 0xffb0, 0xffc0, 0xffd0, 0xff00, 0xfee0, 0xfee7, 0x1802, 0x1803, 0x1804]
+  .map(numberToUUID)
+// Avisos que no son pulsaciones (batería, cambios de servicio, nombre…)
+const NOT_BUTTONS = new Set([0x2a19, 0x2a05, 0x2a00, 0x2a01, 0x2a04].map(numberToUUID))
+
 const isNative = Capacitor.isNativePlatform()
 const bleSupported = isNative || (typeof navigator !== 'undefined' && !!navigator.bluetooth)
 
-// Almacén global: los iTag siguen conectados aunque cambies de pantalla
+// Almacén global: los dispositivos siguen conectados aunque cambies de pantalla
 const itags = {
   slots: [null, null], // { deviceId, name, status }
   handlers: [null, null], // (kind: 'click' | 'hold') => void
@@ -149,26 +156,15 @@ const itags = {
 let bleInit
 const ensureBle = () => (bleInit ??= BleClient.initialize({ androidNeverForLocation: true }))
 
-async function connectItag(slot) {
-  await ensureBle()
-  const dev = await BleClient.requestDevice({ optionalServices: [ITAG_SVC, ALERT_SVC, LINK_LOSS_SVC] })
-  itags.set(slot, { deviceId: dev.deviceId, name: dev.name || 'iTag', status: 'connecting' })
-  await BleClient.connect(dev.deviceId, () => {
-    if (itags.slots[slot]?.deviceId === dev.deviceId) itags.set(slot, { ...itags.slots[slot], status: 'lost' })
-  })
-  // Evita que el iTag pite al perder la conexión
-  BleClient.write(dev.deviceId, LINK_LOSS_SVC, ALERT_LEVEL, numbersToDataView([0])).catch(() => {})
-
-  // Algunos iTag envían 1 al pulsar y 0 al soltar: así detectamos "mantener presionado".
-  // Los que solo envían un aviso por clic usan triple clic para borrar.
+// Convierte los avisos de un botón en 'click' / 'hold'.
+// Algunos envían 1 al pulsar y 0 al soltar (así detectamos "mantener"); otros solo un aviso por clic.
+function makeButtonParser(fire) {
   let downAt = 0
   let sendsRelease = false
   let holdTimer
-  const fire = (k) => itags.handlers[slot]?.(k)
-  await BleClient.startNotifications(dev.deviceId, ITAG_SVC, ITAG_BTN, (value) => {
+  return (value) => {
     const pressed = value.byteLength ? value.getUint8(0) !== 0 : true
     if (!pressed) {
-      // Soltó el botón
       const wasFirstRelease = !sendsRelease
       sendsRelease = true
       clearTimeout(holdTimer)
@@ -179,8 +175,51 @@ async function connectItag(slot) {
     downAt = Date.now()
     if (!sendsRelease) { fire('click'); return }
     holdTimer = setTimeout(() => { if (downAt) { downAt = 0; fire('hold') } }, HOLD_MS)
-  })
-  itags.set(slot, { deviceId: dev.deviceId, name: dev.name || 'iTag', status: 'connected' })
+  }
+}
+
+async function connectItag(slot) {
+  await ensureBle()
+  const dev = await BleClient.requestDevice({ optionalServices: [...BUTTON_SERVICES, numberToUUID(0x180f)] })
+  const name = dev.name || 'Botón Bluetooth'
+  itags.set(slot, { deviceId: dev.deviceId, name, status: 'connecting' })
+  try {
+    await BleClient.connect(dev.deviceId, () => {
+      if (itags.slots[slot]?.deviceId === dev.deviceId) itags.set(slot, { ...itags.slots[slot], status: 'lost' })
+    })
+    // Evita que el dispositivo pite al perder la conexión
+    BleClient.write(dev.deviceId, LINK_LOSS_SVC, ALERT_LEVEL, numbersToDataView([0])).catch(() => {})
+
+    // Busca todas las características que avisan (notify / indicate); la del iTag clásico primero
+    const services = await BleClient.getServices(dev.deviceId)
+    const targets = services.flatMap((s) => s.characteristics
+      .filter((c) => (c.properties.notify || c.properties.indicate) && !NOT_BUTTONS.has(c.uuid.toLowerCase()))
+      .map((c) => [s.uuid, c.uuid]))
+    targets.sort(([, a]) => (a.toLowerCase() === ITAG_BTN ? -1 : 0))
+
+    // Un mismo clic puede llegar por dos características: se ignora el duplicado
+    let last = { t: 0, src: null }
+    const fireFrom = (src) => (kind) => {
+      const now = Date.now()
+      if (kind === 'click' && src !== last.src && now - last.t < 150) return
+      last = { t: now, src }
+      itags.handlers[slot]?.(kind)
+    }
+
+    let listening = 0
+    for (const [svc, chr] of targets) {
+      try {
+        await BleClient.startNotifications(dev.deviceId, svc, chr, makeButtonParser(fireFrom(chr)))
+        listening++
+      } catch { /* esa característica no permite avisos */ }
+    }
+    if (!listening) throw new Error(`${name} no envía avisos al pulsar su botón. Prueba con otro rastreador o con un botón selfie.`)
+    itags.set(slot, { deviceId: dev.deviceId, name, status: 'connected' })
+  } catch (e) {
+    itags.set(slot, null)
+    BleClient.disconnect(dev.deviceId).catch(() => {})
+    throw e
+  }
 }
 
 async function beepItag(slot) {
@@ -189,13 +228,87 @@ async function beepItag(slot) {
   try {
     await BleClient.write(s.deviceId, ALERT_SVC, ALERT_LEVEL, numbersToDataView([2]))
     setTimeout(() => BleClient.write(s.deviceId, ALERT_SVC, ALERT_LEVEL, numbersToDataView([0])).catch(() => {}), 600)
-  } catch { /* algunos iTag no soportan alerta */ }
+  } catch { /* algunos rastreadores no permiten sonar */ }
 }
 
 async function disconnectItag(slot) {
   const s = itags.slots[slot]
   itags.set(slot, null)
   if (s) await BleClient.disconnect(s.deviceId).catch(() => {})
+}
+
+/* ── Botones selfie (AB Shutter 3 y similares) ──
+   Se emparejan desde los ajustes Bluetooth del teléfono y funcionan como un teclado:
+   el botón "Android" envía Enter y el botón "iOS" envía Subir volumen.
+   En el navegador llega Enter (y cualquier otra tecla); el volumen solo se puede leer en la app nativa. */
+const KEY_NAMES = {
+  Enter: 'Enter', NumpadEnter: 'Enter', Space: 'Espacio', AudioVolumeUp: 'Subir volumen', AudioVolumeDown: 'Bajar volumen',
+  VolumeUp: 'Subir volumen', VolumeDown: 'Bajar volumen', ArrowUp: 'Flecha ↑', ArrowDown: 'Flecha ↓',
+  ArrowLeft: 'Flecha ←', ArrowRight: 'Flecha →', PageUp: 'Pág ↑', PageDown: 'Pág ↓', MediaPlayPause: 'Play/Pausa',
+  MediaTrackNext: 'Siguiente', MediaTrackPrevious: 'Anterior',
+}
+const keyId = (e) => (e.code && e.code !== 'Unidentified' ? e.code : e.key)
+const keyLabel = (id) => KEY_NAMES[id] ?? id.replace(/^Key/, '').replace(/^Digit/, '')
+
+const selfie = {
+  keys: (() => { try { return JSON.parse(localStorage.getItem('selfieKeys')) ?? [null, null] } catch { return [null, null] } })(),
+  learning: null, // jugador que está esperando su botón
+  listeners: new Set(),
+  emit() { this.snap = { keys: this.keys, learning: this.learning }; this.listeners.forEach((l) => l()) },
+  assign(slot, id) {
+    this.keys = this.keys.map((k, i) => (i === slot ? id : k === id ? null : k)) // una tecla, un jugador
+    try { localStorage.setItem('selfieKeys', JSON.stringify(this.keys)) } catch { /* ignore */ }
+    this.learning = null
+    this.emit()
+  },
+  learn(slot) { this.learning = slot; this.emit() },
+  subscribe(l) { selfie.listeners.add(l); return () => selfie.listeners.delete(l) },
+  snapshot() { return selfie.snap },
+}
+selfie.snap = { keys: selfie.keys, learning: null }
+
+// Una pulsación de tecla/botón: corta = clic, larga = mantener
+const keyState = {}
+function keyDown(id) {
+  if (selfie.learning !== null) { selfie.assign(selfie.learning, id); blip(1200); return true }
+  const slot = selfie.keys.indexOf(id)
+  if (slot < 0 || !itags.handlers[slot]) return false
+  if (keyState[id]) return true // auto-repetición mientras se mantiene
+  keyState[id] = { fired: false, t: setTimeout(() => { keyState[id].fired = true; itags.handlers[slot]?.('hold') }, HOLD_MS) }
+  return true
+}
+function keyUp(id) {
+  const st = keyState[id]
+  if (!st) return false
+  clearTimeout(st.t)
+  delete keyState[id]
+  const slot = selfie.keys.indexOf(id)
+  if (!st.fired && slot >= 0) itags.handlers[slot]?.('click')
+  return true
+}
+
+if (typeof window !== 'undefined') {
+  const typing = (e) => /^(INPUT|TEXTAREA|SELECT)$/.test(e.target?.tagName ?? '') || e.target?.isContentEditable
+  window.addEventListener('keydown', (e) => {
+    if (typing(e) && selfie.learning === null) return
+    if (keyDown(keyId(e))) { e.preventDefault(); document.activeElement?.blur?.() }
+  }, true)
+  window.addEventListener('keyup', (e) => { if (keyUp(keyId(e))) e.preventDefault() }, true)
+}
+
+// App nativa: el botón "iOS" del selfie (Subir volumen) llega como botón de volumen del teléfono
+let volumeWatching = false
+async function watchVolumeButtons(on) {
+  if (!isNative || on === volumeWatching) return
+  volumeWatching = on
+  try {
+    if (!on) return await VolumeButtons.clearWatch()
+    await VolumeButtons.watchVolume({ disableSystemVolumeHandler: true, suppressVolumeIndicator: true }, (r) => {
+      const id = r?.direction === 'down' ? 'VolumeDown' : 'VolumeUp'
+      // El volumen no avisa al soltar: cada pulsación cuenta como clic
+      if (keyDown(id)) keyUp(id)
+    })
+  } catch { volumeWatching = false }
 }
 
 /* ═════════════════════════ UTILIDADES DE PANTALLA / SONIDO ═════════════════════════ */
@@ -846,6 +959,7 @@ function Match({ id, me, onExit }) {
   const [showSetup, setShowSetup] = useState(false)
   const [autoSpeak, setAutoSpeak] = useState(() => lsGet('autoSpeak', true))
   const slots = useSyncExternalStore(itags.subscribe, itags.snapshot)
+  const keys = useSyncExternalStore(selfie.subscribe, selfie.snapshot)
   const chRef = useRef(null)
   const localRef = useRef(false)
   useWakeLock(true)
@@ -900,12 +1014,18 @@ function Match({ id, me, onExit }) {
   // Conectar los iTag de este dispositivo con el marcador
   const actRef = useRef(act)
   actRef.current = act
+  const [pulse, setPulse] = useState({ p: null, n: 0 })
   useEffect(() => {
     const decoders = [0, 1].map((p) => makeClickDecoder((a) => actRef.current(a, p)))
     ;[0, 1].forEach((p) => {
-      itags.handlers[p] = (kind) => (kind === 'hold' ? actRef.current('reset', p) : decoders[p]())
+      itags.handlers[p] = (kind) => {
+        setPulse((x) => ({ p, n: x.n + 1 })) // destello: se ve que el botón llegó
+        if (kind === 'hold') actRef.current('reset', p)
+        else decoders[p]()
+      }
     })
-    return () => { itags.handlers = [null, null] }
+    watchVolumeButtons(true)
+    return () => { itags.handlers = [null, null]; watchVolumeButtons(false) }
   }, [])
 
   async function finish() {
@@ -934,7 +1054,8 @@ function Match({ id, me, onExit }) {
     <div className="board">
       {[0, 1].map((p) => (
         <Half key={p} p={p} name={names[p]} label={lbl[p]} serving={g.server === p}
-          lit={g.last === p} onAction={(a) => act(a, p)} itag={slots[p]} />
+          lit={g.last === p} onAction={(a) => act(a, p)} itag={slots[p]} selfieKey={keys.keys[p]}
+          pulse={pulse.p === p ? pulse.n : 0} />
       ))}
 
       <div className="hud">
@@ -958,8 +1079,8 @@ function Match({ id, me, onExit }) {
         <button title="Deshacer" className="orange" onClick={() => act('undo', 0)}>↶</button>
         <button title="Anunciar" className="blue" onClick={() => speak(announceText(g, cfg, names))}>📢</button>
         <button title="Cambiar saque" onClick={() => act('server', 0)}>🎾⇄</button>
-        <button title="iTags" onClick={() => setShowSetup(true)}>
-          📡 {slots.filter((x) => x?.status === 'connected').length}/2
+        <button title="Botones (iTag, rastreador, selfie)" onClick={() => setShowSetup(true)}>
+          📡 {[0, 1].filter((p) => slots[p]?.status === 'connected' || keys.keys[p]).length}/2
         </button>
         <button title="Pantalla completa / TV" onClick={toggleFullscreen}>⛶</button>
         <button title="Finalizar" className="red" onClick={finish}>🏁</button>
@@ -968,7 +1089,7 @@ function Match({ id, me, onExit }) {
       {toast && <div className="toast">{toast}</div>}
 
       {showSetup && (
-        <ItagSetup names={names} mySlot={mySlot} slots={slots} autoSpeak={autoSpeak}
+        <ItagSetup names={names} mySlot={mySlot} slots={slots} keys={keys} pulse={pulse} autoSpeak={autoSpeak}
           setAutoSpeak={(v) => { setAutoSpeak(v); lsSet('autoSpeak', v) }} onClose={() => setShowSetup(false)} />
       )}
 
@@ -977,7 +1098,7 @@ function Match({ id, me, onExit }) {
   )
 }
 
-function Half({ p, name, label, serving, lit, onAction, itag }) {
+function Half({ p, name, label, serving, lit, onAction, itag, selfieKey, pulse }) {
   const decoder = useRef(null)
   const hold = useRef({ t: null, fired: false })
   const onActionRef = useRef(onAction)
@@ -1000,14 +1121,16 @@ function Half({ p, name, label, serving, lit, onAction, itag }) {
       <div className="pname">
         <span className="tag">{name}</span>
         {itag && <span className={`dot ${itag.status}`} title={itag.name} />}
+        {selfieKey && <span className="dot connected" title={`Botón selfie: ${keyLabel(selfieKey)}`} />}
       </div>
+      {pulse > 0 && <span className="flash" key={pulse} />}
       {serving && <span className="serve" />}
       <div className="score">{label}</div>
     </div>
   )
 }
 
-function ItagSetup({ names, mySlot, slots, autoSpeak, setAutoSpeak, onClose }) {
+function ItagSetup({ names, mySlot, slots, keys, pulse, autoSpeak, setAutoSpeak, onClose }) {
   const [busy, setBusy] = useState(null)
   const [err, setErr] = useState(null)
 
@@ -1018,45 +1141,94 @@ function ItagSetup({ names, mySlot, slots, autoSpeak, setAutoSpeak, onClose }) {
     setBusy(null)
   }
 
+  // Al cerrar, deja de esperar un botón selfie
+  const close = () => { if (selfie.learning !== null) { selfie.learning = null; selfie.emit() } onClose() }
+
   const order = mySlot === 1 ? [1, 0] : [0, 1]
+  const status = { connected: 'conectado', connecting: 'conectando…', lost: 'desconectado' }
+  const sameKey = keys.keys[0] && keys.keys[0] === keys.keys[1]
+
   return (
-    <div className="modal" onClick={onClose}>
+    <div className="modal" onClick={close}>
       <div className="card sheet" onClick={(e) => e.stopPropagation()}>
-        <h3>Botones iTag</h3>
+        <h3>Botones de los jugadores</h3>
         <p className="muted small">
-          Asigna un iTag a cada jugador. Puedes conectar los dos en este teléfono, o cada jugador el suyo en su
-          propio teléfono: los puntos se sincronizan en vivo.
+          Cada jugador puede usar un <b>iTag o rastreador Bluetooth</b> y/o un <b>botón selfie</b>. Conéctalos en
+          este teléfono, o cada jugador en el suyo: los puntos se sincronizan en vivo.
         </p>
-        {!bleSupported && (
-          <p className="warn">Bluetooth no disponible aquí. iPhone: app nativa o navegador Bluefy · Android: Chrome.</p>
-        )}
+
         {order.map((slot) => {
           const s = slots[slot]
+          const k = keys.keys[slot]
+          const learning = keys.learning === slot
           return (
-            <div key={slot} className="row">
-              <span>
-                <b>{names[slot]}</b>{slot === mySlot && <span className="muted"> (tú)</span>}<br />
-                <span className={`small ${s?.status === 'connected' ? 'ok' : 'muted'}`}>
-                  {s ? `${s.name} · ${{ connected: 'conectado', connecting: 'conectando…', lost: 'desconectado' }[s.status]}` : 'Sin iTag'}
+            <div key={slot} className={`player-block ${pulse.p === slot ? 'hit' : ''}`} data-n={pulse.p === slot ? pulse.n : 0}>
+              <div className="pb-head">
+                <b>{names[slot]}</b>{slot === mySlot && <span className="muted"> (tú)</span>}
+                {pulse.p === slot && <span className="hit-dot" key={pulse.n}>● pulsó</span>}
+              </div>
+
+              <div className="row">
+                <span>
+                  📡 <span className="small">iTag / rastreador</span><br />
+                  <span className={`small ${s?.status === 'connected' ? 'ok' : 'muted'}`}>
+                    {s ? `${s.name} · ${status[s.status]}` : bleSupported ? 'Sin conectar' : 'Bluetooth no disponible aquí'}
+                  </span>
                 </span>
-              </span>
-              <span className="actions">
-                {s?.status === 'connected' && <button className="btn ghost sm" onClick={() => beepItag(slot)}>🔔</button>}
-                {s ? (
-                  <>
-                    {s.status === 'lost' && <button className="btn sm" onClick={() => link(slot)}>Reconectar</button>}
-                    <button className="btn ghost sm" onClick={() => disconnectItag(slot)}>Quitar</button>
-                  </>
-                ) : (
-                  <button className="btn primary sm" disabled={!bleSupported || busy !== null} onClick={() => link(slot)}>
-                    {busy === slot ? 'Buscando…' : 'Vincular'}
-                  </button>
-                )}
-              </span>
+                <span className="actions">
+                  {s?.status === 'connected' && <button className="btn ghost sm" title="Hacer sonar" onClick={() => beepItag(slot)}>🔔</button>}
+                  {s ? (
+                    <>
+                      {s.status === 'lost' && <button className="btn sm" onClick={() => link(slot)}>Reconectar</button>}
+                      <button className="btn ghost sm" onClick={() => disconnectItag(slot)}>Quitar</button>
+                    </>
+                  ) : (
+                    <button className="btn primary sm" disabled={!bleSupported || busy !== null} onClick={() => link(slot)}>
+                      {busy === slot ? 'Buscando…' : 'Vincular'}
+                    </button>
+                  )}
+                </span>
+              </div>
+
+              <div className="row">
+                <span>
+                  📸 <span className="small">Botón selfie</span><br />
+                  <span className={`small ${learning ? 'learning' : k ? 'ok' : 'muted'}`}>
+                    {learning ? 'Pulsa ahora el botón selfie…' : k ? `Asignado: ${keyLabel(k)}` : 'Sin asignar'}
+                  </span>
+                </span>
+                <span className="actions">
+                  {learning ? (
+                    <button className="btn ghost sm" onClick={() => { selfie.learning = null; selfie.emit() }}>Cancelar</button>
+                  ) : (
+                    <>
+                      {k && <button className="btn ghost sm" onClick={() => selfie.assign(slot, null)}>Quitar</button>}
+                      <button className={`btn sm ${k ? '' : 'primary'}`} onClick={() => selfie.learn(slot)}>
+                        {k ? 'Cambiar' : 'Asignar'}
+                      </button>
+                    </>
+                  )}
+                </span>
+              </div>
             </div>
           )
         })}
+
         {err && <p className="err small">{err}</p>}
+        {sameKey && <p className="warn small">Los dos jugadores tienen la misma tecla.</p>}
+
+        <details className="help small">
+          <summary>¿Cómo conecto mi botón?</summary>
+          <p><b>iTag o rastreador Bluetooth:</b> enciéndelo (mantén presionado hasta que pite), pulsa <i>Vincular</i> y
+            elígelo en la lista. Funcionan los iTag y la mayoría de rastreadores “anti-pérdida” genéricos. No funcionan
+            AirTag, SmartTag ni Tile, porque sus marcas los bloquean.</p>
+          <p><b>Botón selfie:</b> primero emparéjalo en los <i>Ajustes → Bluetooth</i> del teléfono. Luego pulsa
+            <i> Asignar</i> y presiona el botón. En el navegador usa el botón <b>“Android”</b> (envía Enter). El botón
+            “iOS” (subir volumen) solo funciona en la app instalada desde Android Studio o Xcode.</p>
+          <p><b>Dos botones selfie en el mismo teléfono</b> envían la misma tecla y no se pueden distinguir. Usa un
+            botón selfie para un jugador y un iTag para el otro, o que cada jugador conecte su botón en su teléfono.</p>
+        </details>
+
         <div className="legend small">
           <div><b>1 clic</b> → suma punto</div>
           <div><b>2 clics</b> → devuelve el último punto</div>
@@ -1067,9 +1239,9 @@ function ItagSetup({ names, mySlot, slots, autoSpeak, setAutoSpeak, onClose }) {
           <input type="checkbox" checked={autoSpeak} onChange={(e) => setAutoSpeak(e.target.checked)} />
           Anunciar el marcador en voz alta
         </label>
-        <p className="muted small">📺 Para verlo en la TV usa “Duplicar pantalla” (Android / Chromecast) o “Duplicar
-          pantalla” en AirPlay (iPhone) y pulsa ⛶.</p>
-        <button className="btn block" onClick={onClose}>Listo</button>
+        <p className="muted small">📺 Para verlo en la TV usa “Duplicar pantalla” (Android / Chromecast) o AirPlay
+          (iPhone) y pulsa ⛶.</p>
+        <button className="btn block" onClick={close}>Listo</button>
       </div>
     </div>
   )

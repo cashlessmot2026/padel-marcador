@@ -14,6 +14,17 @@ con usuarios, invitaciones y marcador sincronizado en tiempo real con **Supabase
 
 \* Algunos iTag solo avisan al pulsar (no al soltar). En esos, “mantener” no se puede detectar y se usa **triple clic**.
 
+### Botones compatibles
+
+| Botón | Cómo se conecta | Dónde funciona |
+|---|---|---|
+| **iTag** y rastreadores “anti-pérdida” Bluetooth genéricos | 📡 → *Vincular* (desde la app) | Chrome Android/PC, Bluefy (iPhone), app nativa |
+| **Botón selfie** (AB Shutter 3 y similares) | Emparejar en *Ajustes → Bluetooth*, luego 📡 → *Asignar* y pulsarlo | Botón “Android” (Enter): navegador y app. Botón “iOS” (subir volumen): solo app nativa |
+
+- AirTag, Samsung SmartTag y Tile **no** se pueden usar porque sus marcas bloquean la conexión.
+- Dos botones selfie en el mismo teléfono envían la misma tecla y no se distinguen: combina un selfie y un iTag,
+  o que cada jugador conecte su botón en su propio teléfono.
+
 - Registro rápido (nombre, usuario, correo, contraseña).
 - Buscar jugadores registrados por nombre o `@usuario` e **invitarlos** (les llega al instante).
 - También puedes jugar contra un **rival local sin cuenta**.
@@ -27,6 +38,7 @@ con usuarios, invitaciones y marcador sincronizado en tiempo real con **Supabase
 
 - [`@supabase/supabase-js`](https://github.com/supabase/supabase-js): autenticación, base de datos y tiempo real.
 - [`@capacitor-community/bluetooth-le`](https://github.com/capacitor-community/bluetooth-le): una sola API de Bluetooth LE para Web Bluetooth, Android e iOS.
+- [`@capacitor-community/volume-buttons`](https://github.com/capacitor-community/volume-buttons): lee el botón “iOS” de los selfie (subir volumen) en la app nativa.
 - [Capacitor](https://capacitorjs.com): empaqueta la app web como app nativa de Android e iOS.
 - APIs del navegador: Wake Lock, Fullscreen, Speech Synthesis y Web Audio.
 
