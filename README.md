@@ -6,6 +6,15 @@ con usuarios, invitaciones y marcador sincronizado en tiempo real con **Supabase
 
 ## Funciones
 
+### Iniciar un partido
+- **⚡ Partido rápido**: un solo usuario escribe los nombres de los dos jugadores o parejas, sin que el rival tenga cuenta.
+- **👥 Invitar a un jugador registrado**: cada uno usa su teléfono y su botón, y el marcador se sincroniza.
+- **Configuración del juego**: pádel, tenis o por puntos · puntaje 15-30-40 o 1-2-3 · punto de oro ·
+  juegos por set (4/6) · tie-break · sets (1, mejor de 3, mejor de 5 o libre) · **tiempo de juego** (sin límite,
+  30/45/60/90 min u otro) · **aplausos en cada punto** · **voz que dice quién anotó** · voz que canta el marcador.
+- El partido termina solo cuando alguien gana los sets elegidos. Al cumplirse el tiempo hay aviso, aplausos y la opción de finalizar.
+- La configuración se guarda dentro del partido, así que no hace falta cambiar nada en Supabase.
+
 | Acción | iTag | Pantalla |
 |---|---|---|
 | Sumar punto | 1 clic | Tocar tu mitad |

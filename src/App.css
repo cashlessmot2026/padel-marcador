@@ -325,3 +325,60 @@ input[type='number'] { width: 90px; }
 .help p { margin: 8px 0 0; line-height: 1.45; }
 .flash { position: absolute; inset: 0; pointer-events: none; background: rgba(255, 255, 255, 0.55); animation: flash 0.35s ease-out forwards; }
 @keyframes flash { to { opacity: 0; } }
+
+/* ───────── nuevo partido ───────── */
+.start-options { display: grid; gap: 10px; }
+.start-opt {
+  display: flex; align-items: center; gap: 14px; text-align: left; padding: 16px; border-radius: 16px; cursor: pointer;
+  border: 1.5px solid var(--line); background: #fbfcfd; transition: border-color 0.2s, transform 0.12s, box-shadow 0.2s;
+}
+.start-opt:hover { border-color: var(--lime); box-shadow: 0 6px 18px rgba(139, 227, 58, 0.18); }
+.start-opt:active { transform: scale(0.99); }
+.so-icon { font-size: 1.8rem; width: 52px; height: 52px; display: grid; place-items: center; border-radius: 14px; background: #eef9e2; flex: none; }
+.back { margin: -6px 0 8px -8px; align-self: flex-start; }
+
+.setup { display: flex; flex-direction: column; gap: 4px; }
+.setup-sec { padding: 12px 0; border-top: 1px solid var(--line); display: flex; flex-direction: column; gap: 8px; }
+.setup-sec:first-of-type { border-top: 0; }
+.setup-sec h4 { margin: 0; font-size: 0.95rem; }
+.setup .seg { margin: 0; flex-wrap: wrap; }
+.setup .seg button { padding: 9px 6px; font-size: 0.9rem; min-width: 0; flex: 1 1 auto; white-space: nowrap; }
+.names { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); gap: 8px; align-items: center; }
+.vs-dot { font-weight: 900; color: var(--muted); font-size: 0.85rem; }
+.fixed-name { padding: 13px 14px; border-radius: 12px; background: #eef9e2; font-weight: 800; }
+.two { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 10px; }
+.two > div { display: flex; flex-direction: column; gap: 4px; }
+.setup .cta { margin-top: 10px; }
+@media (max-width: 420px) {
+  .names { grid-template-columns: 1fr; }
+  .vs-dot { text-align: center; }
+}
+
+.toggle { display: flex; align-items: center; justify-content: space-between; gap: 12px; cursor: pointer; padding: 4px 0; }
+.toggle input { position: absolute; opacity: 0; pointer-events: none; }
+.toggle i {
+  position: relative; flex: none; width: 46px; height: 28px; border-radius: 99px; background: #d5dbe3; transition: background 0.2s;
+}
+.toggle i::after {
+  content: ''; position: absolute; top: 3px; left: 3px; width: 22px; height: 22px; border-radius: 50%; background: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25); transition: transform 0.2s;
+}
+.toggle input:checked + i { background: var(--lime-dark); }
+.toggle input:checked + i::after { transform: translateX(18px); }
+.toggle input:focus-visible + i { box-shadow: 0 0 0 3px rgba(47, 124, 246, 0.4); }
+
+/* ───────── reloj y formato en el marcador ───────── */
+.clock {
+  pointer-events: auto; border: 0; cursor: pointer; background: rgba(11, 31, 58, 0.9); color: #fff; font-weight: 800;
+  padding: 5px 14px; border-radius: 99px; font-size: clamp(0.75rem, 2.2vmin, 1.3rem); font-variant-numeric: tabular-nums;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.2);
+}
+.clock.paused { background: #6b7686; }
+.clock.over { background: var(--red); animation: blink 1s ease-in-out infinite; }
+.format { background: rgba(255, 255, 255, 0.85); color: var(--navy); font-weight: 800; border-radius: 99px; padding: 2px 10px; font-size: clamp(0.62rem, 1.6vmin, 0.95rem); }
+.timeup {
+  position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); z-index: 5; display: flex; flex-direction: column;
+  align-items: center; gap: 12px; background: #fff; padding: 20px 24px; border-radius: 20px; box-shadow: 0 20px 60px rgba(0, 0, 0, 0.35);
+  font-size: 1.3rem; animation: pop 0.35s cubic-bezier(.2, 1.4, .4, 1);
+}
+.timeup span { display: flex; gap: 8px; }

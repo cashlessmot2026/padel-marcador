@@ -13,33 +13,57 @@ const SUPABASE_ANON_KEY =
   import.meta.env.VITE_SUPABASE_ANON_KEY ||
   'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFzd3Vxc2VuZmpnd3FzZXNldGhlIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODgyMDI1NTQsImV4cCI6MjEwMzc3ODU1NH0.cZCMLIsLAEXwOsbXS7wpfnI7xb-kqK-sduHPjrCndbQ'
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
+const DEMO = import.meta.env.DEV // pantallas de prueba (#demo-match, #demo-setup) solo en desarrollo
 
 /* ═════════════════════════ MARCADOR (lógica pura) ═════════════════════════ */
 const TENNIS = ['0', '15', '30', '40']
-const GAMES_PER_SET = 6
 
-const newGame = (server = 0) => ({
-  points: [0, 0], games: [0, 0], sets: [0, 0],
-  setLog: [], server, last: null, tiebreak: false, v: 0,
+// Configuración de un partido (se guarda dentro del estado del partido: no requiere columnas nuevas)
+const DEFAULT_CFG = {
+  sport: 'padel', // padel | tennis | points
+  scoring: 'classic', // classic = 15-30-40 · numeric = 1-2-3
+  golden: true, // punto de oro en 40-40 (pádel)
+  gamesPerSet: 6,
+  setsToWin: 2, // 1 = a un set · 2 = al mejor de 3 · 3 = al mejor de 5 · 0 = sin límite
+  tiebreak: true,
+  target: 11, // puntos por set en modo "por puntos"
+  minutes: 0, // tiempo de juego, 0 = sin límite
+  applause: true, // aplausos en cada punto
+  voiceName: true, // la voz dice quién anotó
+  voiceScore: true, // la voz canta el marcador
+}
+const isPoints = (cfg) => cfg.sport === 'points'
+
+// Partidos creados antes de la configuración nueva
+const legacyCfg = (m) => ({
+  ...DEFAULT_CFG, sport: m?.mode === 'points' ? 'points' : 'tennis', golden: false, setsToWin: 0,
+  target: m?.target ?? 11, applause: false, voiceName: false,
 })
 
-function closeSet(g, p, finalScore) {
+const newGame = (cfg = DEFAULT_CFG, server = 0) => ({
+  cfg, points: [0, 0], games: [0, 0], sets: [0, 0], setLog: [], server, last: null, tiebreak: false,
+  winner: null, evt: null, clock: { start: null, pausedAt: null, paused: 0 }, v: 0,
+})
+
+function closeSet(g, p, finalScore, cfg) {
   const sets = [...g.sets]
   sets[p]++
-  return { ...g, sets, setLog: [...g.setLog, finalScore], points: [0, 0], games: [0, 0], tiebreak: false }
+  const winner = cfg.setsToWin > 0 && sets[p] >= cfg.setsToWin ? p : null
+  return { ...g, sets, setLog: [...g.setLog, finalScore], points: [0, 0], games: [0, 0], tiebreak: false, winner }
 }
 
 function addPoint(g, p, cfg) {
+  if (g.winner !== null && g.winner !== undefined) return g
   const o = 1 - p
   const pts = [...g.points]
   pts[p]++
   let n = { ...g, points: pts, last: p }
 
-  if (cfg.mode === 'points') {
+  if (isPoints(cfg)) {
     const t = cfg.target
     const deuce = pts[0] >= t - 1 && pts[1] >= t - 1
     if (deuce || (pts[0] + pts[1]) % 2 === 0) n.server = 1 - g.server
-    if (pts[p] >= t && pts[p] - pts[o] >= 2) n = closeSet(n, p, pts)
+    if (pts[p] >= t && pts[p] - pts[o] >= 2) n = closeSet(n, p, pts, cfg)
     return n
   }
 
@@ -48,33 +72,38 @@ function addPoint(g, p, cfg) {
     if (pts[p] >= 7 && pts[p] - pts[o] >= 2) {
       const games = [...g.games]
       games[p]++
-      n = closeSet({ ...n, server: 1 - g.server }, p, games)
+      n = closeSet({ ...n, server: 1 - g.server }, p, games, cfg)
     }
     return n
   }
 
-  if (pts[p] >= 4 && pts[p] - pts[o] >= 2) {
+  // Gana el juego con 4 puntos y 2 de diferencia, o con punto de oro en 40-40
+  if (pts[p] >= 4 && (pts[p] - pts[o] >= 2 || (cfg.golden && pts[o] >= 3))) {
     const games = [...g.games]
     games[p]++
+    const gps = cfg.gamesPerSet
     n = { ...n, games, points: [0, 0], server: 1 - g.server }
-    if (games[p] >= GAMES_PER_SET && games[p] - games[o] >= 2) n = closeSet(n, p, games)
-    else if (games[0] === GAMES_PER_SET && games[1] === GAMES_PER_SET) n.tiebreak = true
+    if (games[p] >= gps && (games[p] - games[o] >= 2 || (cfg.tiebreak && games[p] === gps + 1))) {
+      n = closeSet(n, p, games, cfg)
+    } else if (cfg.tiebreak && games[0] === gps && games[1] === gps) n.tiebreak = true
   }
   return n
 }
 
 function labels(g, cfg) {
-  if (cfg.mode === 'points' || g.tiebreak)
+  if (isPoints(cfg) || g.tiebreak)
     return { a: [String(g.points[0]), String(g.points[1])], note: g.tiebreak ? 'TIE-BREAK' : '' }
   const [a, b] = g.points
+  const num = cfg.scoring === 'numeric'
   if (a >= 3 && b >= 3) {
-    if (a === b) return { a: ['40', '40'], note: 'IGUALES' }
-    return { a: a > b ? ['AD', '40'] : ['40', 'AD'], note: 'VENTAJA' }
+    if (a === b) return { a: num ? [String(a), String(b)] : ['40', '40'], note: cfg.golden ? 'PUNTO DE ORO' : 'IGUALES' }
+    return { a: num ? [String(a), String(b)] : a > b ? ['AD', '40'] : ['40', 'AD'], note: 'VENTAJA' }
   }
-  return { a: [TENNIS[a], TENNIS[b]], note: '' }
+  return { a: num ? [String(a), String(b)] : [TENNIS[a], TENNIS[b]], note: '' }
 }
 
 function winnerSlot(g) {
+  if (g.winner === 0 || g.winner === 1) return g.winner
   for (const k of ['sets', 'games', 'points']) {
     if (g[k][0] !== g[k][1]) return g[k][0] > g[k][1] ? 0 : 1
   }
@@ -85,26 +114,50 @@ const SAY = { 0: 'cero', 15: 'quince', 30: 'treinta', 40: 'cuarenta' }
 function announceText(g, cfg, names) {
   const { a, note } = labels(g, cfg)
   if (note === 'IGUALES') return 'Iguales'
-  if (note === 'VENTAJA') return `Ventaja ${names[a[0] === 'AD' ? 0 : 1]}`
+  if (note === 'PUNTO DE ORO') return 'Punto de oro'
+  if (note === 'VENTAJA') return `Ventaja ${names[g.points[0] > g.points[1] ? 0 : 1]}`
   if (g.points[0] === 0 && g.points[1] === 0 && g.last !== null) {
-    const unit = cfg.mode === 'points' ? 'Sets' : 'Juegos'
-    const v = cfg.mode === 'points' ? g.sets : g.games
+    const unit = isPoints(cfg) ? 'Sets' : 'Juegos'
+    const v = isPoints(cfg) ? g.sets : g.games
     return `${unit}: ${names[0]} ${v[0]}, ${names[1]} ${v[1]}`
   }
   const s = g.server
   return `${SAY[a[s]] ?? a[s]}, ${SAY[a[1 - s]] ?? a[1 - s]}`
 }
 
-// Estado + historial para deshacer
+// Reloj del partido (se pausa y se sincroniza con el resto del estado)
+const clockElapsed = (c, now = Date.now()) => (c?.start ? (c.pausedAt ?? now) - c.start - (c.paused ?? 0) : 0)
+const fmtClock = (ms) => {
+  const t = Math.max(0, Math.round(ms / 1000))
+  const h = Math.floor(t / 3600), m = Math.floor((t % 3600) / 60), s = t % 60
+  return `${h ? `${h}:` : ''}${String(m).padStart(h ? 2 : 1, '0')}:${String(s).padStart(2, '0')}`
+}
+function toggleClock(c, now) {
+  if (!c.start) return { start: now, pausedAt: null, paused: 0 }
+  if (c.pausedAt) return { ...c, pausedAt: null, paused: c.paused + (now - c.pausedAt) }
+  return { ...c, pausedAt: now }
+}
+
+// Estado + historial para deshacer. El reloj no retrocede al deshacer.
 const pushState = (s, game) => ({ game, past: [...s.past.slice(-200), s.game] })
 function scoreReducer(s, a) {
+  const g = s.game
+  const evt = (type, p) => ({ type, p, id: a.v })
   switch (a.type) {
-    case 'point': return pushState(s, { ...addPoint(s.game, a.p, a.cfg), v: a.v })
-    case 'undo': return s.past.length ? { game: { ...s.past.at(-1), v: a.v }, past: s.past.slice(0, -1) } : s
-    case 'reset': return pushState(s, { ...newGame(s.game.server), v: a.v })
-    case 'server': return pushState(s, { ...s.game, server: 1 - s.game.server, v: a.v })
+    case 'point': {
+      if (g.winner !== null && g.winner !== undefined) return s
+      const clock = g.clock?.start ? g.clock : { start: a.v, pausedAt: null, paused: 0 } // arranca con el 1er punto
+      return pushState(s, { ...addPoint(g, a.p, a.cfg), clock, evt: evt('point', a.p), v: a.v })
+    }
+    case 'undo':
+      return s.past.length
+        ? { game: { ...s.past.at(-1), clock: g.clock, evt: evt('undo', a.p), v: a.v }, past: s.past.slice(0, -1) }
+        : s
+    case 'reset': return pushState(s, { ...newGame(a.cfg, g.server), clock: g.clock, evt: evt('reset', a.p), v: a.v })
+    case 'server': return pushState(s, { ...g, server: 1 - g.server, evt: null, v: a.v })
+    case 'clock': return { ...s, game: { ...g, clock: toggleClock(g.clock ?? {}, a.v), evt: null, v: a.v } }
     case 'remote':
-      if ((a.game?.v ?? 0) <= (s.game.v ?? 0)) return s
+      if ((a.game?.v ?? 0) <= (g.v ?? 0)) return s
       return { game: a.game, past: a.past ?? s.past }
     default: return s
   }
@@ -332,6 +385,46 @@ function blip(freq = 880) {
   } catch { /* sin audio */ }
 }
 
+// Aplausos sintetizados: muchas palmadas cortas de ruido filtrado (no necesita archivos de audio)
+let applauseBuf
+function applause(seconds = 1.6, volume = 0.5) {
+  try {
+    audioCtx ??= new (window.AudioContext || window.webkitAudioContext)()
+    const ctx = audioCtx
+    if (ctx.state === 'suspended') ctx.resume()
+    const sr = ctx.sampleRate
+    if (!applauseBuf || applauseBuf.duration < seconds) {
+      const len = Math.floor(sr * 3)
+      applauseBuf = ctx.createBuffer(2, len, sr)
+      for (let ch = 0; ch < 2; ch++) {
+        const d = applauseBuf.getChannelData(ch)
+        for (let k = 0; k < 900; k++) { // ~300 palmadas por segundo entre muchas personas
+          const at = Math.floor(Math.random() * len)
+          const clapLen = Math.floor(sr * (0.008 + Math.random() * 0.02))
+          const amp = 0.25 + Math.random() * 0.75
+          for (let i = 0; i < clapLen && at + i < len; i++) {
+            d[at + i] += (Math.random() * 2 - 1) * amp * Math.exp((-i / clapLen) * 5)
+          }
+        }
+      }
+    }
+    const src = ctx.createBufferSource()
+    src.buffer = applauseBuf
+    const band = ctx.createBiquadFilter()
+    band.type = 'bandpass'
+    band.frequency.value = 1800
+    band.Q.value = 0.6
+    const gain = ctx.createGain()
+    const t0 = ctx.currentTime
+    gain.gain.setValueAtTime(0.0001, t0)
+    gain.gain.exponentialRampToValueAtTime(volume, t0 + 0.08)
+    gain.gain.setValueAtTime(volume, t0 + seconds * 0.55)
+    gain.gain.exponentialRampToValueAtTime(0.0001, t0 + seconds)
+    src.connect(band).connect(gain).connect(ctx.destination)
+    src.start(t0, Math.random() * Math.max(0, applauseBuf.duration - seconds), seconds)
+  } catch { /* sin audio */ }
+}
+
 function speak(text) {
   if (!('speechSynthesis' in window)) return
   speechSynthesis.cancel()
@@ -418,6 +511,11 @@ export default function App() {
     </>
   )
 
+  if (DEMO && window.location.hash === '#demo-match')
+    return <Match id="demo" me={{ id: 'demo', display_name: 'Demo' }} onExit={() => { window.location.hash = '' }} />
+  if (DEMO && window.location.hash === '#demo-setup')
+    return <div className="home"><section className="card"><h3>Nuevo partido</h3>
+      <GameSetup me={{ display_name: 'Ana y Luis' }} onStart={async (c, n) => console.log('start', c, n)} onCancel={() => {}} /></section></div>
   if (session === undefined) return <div className="center muted">Cargando…</div>
   if (!session) return <><Auth onRecovered={issueNewPassword} />{overlays}</>
   if (!profile) return <div className="center muted">Cargando perfil…</div>
@@ -746,14 +844,150 @@ function PasswordReveal({ password, onClose }) {
   )
 }
 
+const SPORTS = { padel: '🎾 Pádel', tennis: '🎾 Tenis', points: '🏓 Por puntos' }
+const sportName = (m) => {
+  const c = m?.state?.cfg
+  if (!c) return m?.mode === 'points' ? `A ${m.target} pts` : 'Tenis'
+  return c.sport === 'points' ? `A ${c.target} pts` : c.sport === 'padel' ? 'Pádel' : 'Tenis'
+}
+
+function Seg({ value, options, onChange }) {
+  return (
+    <div className="seg">
+      {options.map(([v, label]) => (
+        <button key={String(v)} type="button" className={value === v ? 'on' : ''} onClick={() => onChange(v)}>{label}</button>
+      ))}
+    </div>
+  )
+}
+
+function Toggle({ checked, onChange, children }) {
+  return (
+    <label className="toggle">
+      <span>{children}</span>
+      <input type="checkbox" checked={checked} onChange={(e) => onChange(e.target.checked)} />
+      <i aria-hidden />
+    </label>
+  )
+}
+
+/* ─────────────── Configurar el juego ─────────────── */
+function GameSetup({ me, opponent, onStart, onCancel }) {
+  const [cfg, setCfg] = useState(() => ({ ...DEFAULT_CFG, ...lsGet('lastCfg', {}) }))
+  const [names, setNames] = useState([me.display_name, opponent?.display_name ?? ''])
+  const [busy, setBusy] = useState(false)
+  const set = (k) => (v) => setCfg((c) => ({ ...c, [k]: v }))
+  const minutesPreset = [0, 30, 45, 60, 90]
+
+  // Al cambiar de deporte, valores típicos
+  const setSport = (sport) => setCfg((c) => ({
+    ...c, sport,
+    golden: sport === 'padel' ? true : sport === 'tennis' ? false : c.golden,
+    scoring: sport === 'points' ? c.scoring : c.scoring,
+  }))
+
+  async function start(e) {
+    e.preventDefault()
+    setBusy(true)
+    const clean = { ...cfg, target: Math.max(1, Number(cfg.target) || 11), minutes: Math.max(0, Number(cfg.minutes) || 0) }
+    await onStart(clean, names.map((n, i) => n.trim() || `Jugador ${i + 1}`))
+    setBusy(false)
+  }
+
+  const pts = cfg.sport === 'points'
+  return (
+    <form className="setup" onSubmit={start}>
+      <button type="button" className="btn ghost sm back" onClick={onCancel}>← Volver</button>
+
+      <div className="setup-sec">
+        <h4>Jugadores</h4>
+        <div className="names">
+          <input placeholder={cfg.sport === 'padel' ? 'Pareja 1 (ej. Ana y Luis)' : 'Jugador 1'} value={names[0]}
+            onChange={(e) => setNames([e.target.value, names[1]])} maxLength={40} required />
+          <span className="vs-dot">vs</span>
+          {opponent ? (
+            <div className="fixed-name">{opponent.display_name} <span className="muted small">(invitado)</span></div>
+          ) : (
+            <input placeholder={cfg.sport === 'padel' ? 'Pareja 2 (ej. Sol y Mar)' : 'Jugador 2'} value={names[1]}
+              onChange={(e) => setNames([names[0], e.target.value])} maxLength={40} required autoFocus />
+          )}
+        </div>
+      </div>
+
+      <div className="setup-sec">
+        <h4>Tipo de juego</h4>
+        <Seg value={cfg.sport} onChange={setSport} options={Object.entries(SPORTS)} />
+      </div>
+
+      <div className="setup-sec">
+        <h4>Puntaje</h4>
+        {pts ? (
+          <>
+            <Seg value={Number(cfg.target)} onChange={set('target')} options={[[11, 'A 11'], [15, 'A 15'], [21, 'A 21']]} />
+            <label className="inline small">Otro:
+              <input type="number" min="1" max="99" value={cfg.target} onChange={(e) => set('target')(e.target.value)} />
+              puntos por set (gana por 2)
+            </label>
+          </>
+        ) : (
+          <>
+            <Seg value={cfg.scoring} onChange={set('scoring')} options={[['classic', '15 · 30 · 40'], ['numeric', '1 · 2 · 3']]} />
+            <Toggle checked={cfg.golden} onChange={set('golden')}>
+              <b>Punto de oro</b> <span className="muted small">en 40-40 el siguiente punto gana el juego</span>
+            </Toggle>
+            <div className="two">
+              <div>
+                <span className="small muted">Juegos por set</span>
+                <Seg value={cfg.gamesPerSet} onChange={set('gamesPerSet')} options={[[4, '4'], [6, '6']]} />
+              </div>
+              <div>
+                <span className="small muted">Tie-break</span>
+                <Seg value={cfg.tiebreak} onChange={set('tiebreak')} options={[[true, 'Sí'], [false, 'No']]} />
+              </div>
+            </div>
+          </>
+        )}
+        <span className="small muted">Sets</span>
+        <Seg value={cfg.setsToWin} onChange={set('setsToWin')}
+          options={[[1, '1 set'], [2, 'Mejor de 3'], [3, 'Mejor de 5'], [0, 'Libre']]} />
+      </div>
+
+      <div className="setup-sec">
+        <h4>⏱ Tiempo de juego</h4>
+        <Seg value={minutesPreset.includes(Number(cfg.minutes)) ? Number(cfg.minutes) : 'x'} onChange={(v) => set('minutes')(v === 'x' ? 20 : v)}
+          options={[[0, 'Sin límite'], [30, '30′'], [45, '45′'], [60, '60′'], [90, '90′'], ['x', 'Otro']]} />
+        {!minutesPreset.includes(Number(cfg.minutes)) && (
+          <label className="inline small">
+            <input type="number" min="1" max="600" value={cfg.minutes} onChange={(e) => set('minutes')(e.target.value)} /> minutos
+          </label>
+        )}
+      </div>
+
+      <div className="setup-sec">
+        <h4>🔊 Sonido</h4>
+        <Toggle checked={cfg.applause} onChange={set('applause')}>👏 Aplausos en cada punto</Toggle>
+        <Toggle checked={cfg.voiceName} onChange={set('voiceName')}>🗣 Voz que dice quién anotó</Toggle>
+        <Toggle checked={cfg.voiceScore} onChange={set('voiceScore')}>📢 Voz que canta el marcador</Toggle>
+        <button type="button" className="btn ghost sm" onClick={() => {
+          if (cfg.applause) applause()
+          const n = names[0].trim() || 'Jugador 1'
+          speak([cfg.voiceName && `Punto para ${n}`, cfg.voiceScore && (pts ? 'Uno, cero' : 'Quince, cero')].filter(Boolean).join('. '))
+        }}>▶ Probar sonido</button>
+      </div>
+
+      <button className="cta" disabled={busy}>
+        {busy ? <span className="spinner" /> : opponent ? `Invitar a ${opponent.display_name}` : '▶ Empezar partido'}
+      </button>
+    </form>
+  )
+}
+
 /* ─────────────── Inicio: buscar, invitar, invitaciones, historial ─────────────── */
 function Home({ me, onOpen }) {
   const [q, setQ] = useState('')
   const [results, setResults] = useState([])
-  const [opponent, setOpponent] = useState(null) // perfil o { local: true, display_name }
-  const [localName, setLocalName] = useState('')
-  const [mode, setMode] = useState(() => lsGet('mode', 'tennis'))
-  const [target, setTarget] = useState(() => lsGet('target', 11))
+  const [flow, setFlow] = useState(null) // null | 'quick' | 'invite'
+  const [opponent, setOpponent] = useState(null) // perfil del jugador invitado
   const [matches, setMatches] = useState([])
   const [err, setErr] = useState(null)
 
@@ -816,23 +1050,23 @@ function Home({ me, onOpen }) {
     return () => clearTimeout(t)
   }, [q, me.id])
 
-  async function create() {
+  async function create(cfg, names) {
     setErr(null)
-    lsSet('mode', mode)
-    lsSet('target', target)
-    const local = opponent?.local
+    lsSet('lastCfg', cfg)
+    const invite = flow === 'invite' && opponent
     const { data, error } = await supabase.from('matches').insert({
       host_id: me.id,
-      player1_id: me.id, player1_name: me.display_name,
-      player2_id: local ? null : opponent.id, player2_name: opponent.display_name,
-      mode, target: Number(target) || 11,
-      status: local ? 'active' : 'invited',
-      state: newGame(),
+      player1_id: me.id, player1_name: names[0],
+      player2_id: invite ? opponent.id : null, player2_name: names[1],
+      mode: isPoints(cfg) ? 'points' : 'tennis', target: cfg.target,
+      status: invite ? 'invited' : 'active',
+      state: newGame(cfg),
     }).select().single()
     if (error) return setErr(error.message)
+    setFlow(null)
     setOpponent(null)
     setQ('')
-    if (local) onOpen(data.id)
+    if (!invite) onOpen(data.id)
   }
 
   async function respond(m, accept) {
@@ -860,7 +1094,7 @@ function Home({ me, onOpen }) {
           <h3>📨 Invitaciones</h3>
           {invites.map((m) => (
             <div key={m.id} className="row">
-              <span><b>{m.player1_name}</b> te invita · {m.mode === 'tennis' ? 'Tenis' : `A ${m.target} pts`}</span>
+              <span><b>{m.player1_name}</b> te invita · {sportName(m)}</span>
               <span className="actions">
                 <button className="btn primary sm" onClick={() => respond(m, true)}>Aceptar</button>
                 <button className="btn ghost sm" onClick={() => respond(m, false)}>Rechazar</button>
@@ -872,8 +1106,22 @@ function Home({ me, onOpen }) {
 
       <section className="card">
         <h3>Nuevo partido</h3>
-        {!opponent ? (
+        {!flow && (
+          <div className="start-options">
+            <button className="start-opt" onClick={() => setFlow('quick')}>
+              <span className="so-icon">⚡</span>
+              <span><b>Partido rápido</b><br /><span className="muted small">Escribe los nombres y juega ya. No hace falta que el rival tenga cuenta.</span></span>
+            </button>
+            <button className="start-opt" onClick={() => setFlow('invite')}>
+              <span className="so-icon">👥</span>
+              <span><b>Invitar a un jugador registrado</b><br /><span className="muted small">Cada uno usa su teléfono y su botón; el marcador se sincroniza.</span></span>
+            </button>
+          </div>
+        )}
+
+        {flow === 'invite' && !opponent && (
           <>
+            <button className="btn ghost sm back" onClick={() => setFlow(null)}>← Volver</button>
             <input placeholder="Buscar jugador por nombre o @usuario" value={q} onChange={(e) => setQ(e.target.value)}
               autoCapitalize="none" />
             <p className="muted small count">
@@ -884,37 +1132,17 @@ function Home({ me, onOpen }) {
                 <button key={p.id} className="result" onClick={() => setOpponent(p)}>
                   <span className="avatar">{p.display_name[0]?.toUpperCase()}</span>
                   <span><b>{p.display_name}</b> <span className="muted">@{p.username}</span></span>
-                  <span className="pill">Invitar</span>
+                  <span className="pill">Elegir</span>
                 </button>
               ))}
               {!results.length && <p className="muted">{q.trim() ? 'Sin resultados' : 'Aún no hay otros jugadores'}</p>}
             </div>
-            <div className="or">o juega aquí mismo con un amigo sin cuenta</div>
-            <div className="inline">
-              <input placeholder="Nombre del rival" value={localName} onChange={(e) => setLocalName(e.target.value)} />
-              <button className="btn" disabled={!localName.trim()}
-                onClick={() => setOpponent({ local: true, display_name: localName.trim() })}>Elegir</button>
-            </div>
           </>
-        ) : (
-          <>
-            <div className="vs">
-              <b>{me.display_name}</b> <span className="muted">vs</span> <b>{opponent.display_name}</b>
-              <button className="btn ghost sm" onClick={() => setOpponent(null)}>Cambiar</button>
-            </div>
-            <div className="seg">
-              <button className={mode === 'tennis' ? 'on' : ''} onClick={() => setMode('tennis')}>🎾 Tenis / Pádel</button>
-              <button className={mode === 'points' ? 'on' : ''} onClick={() => setMode('points')}>🏓 Por puntos</button>
-            </div>
-            {mode === 'points' && (
-              <label className="inline">Puntos por set
-                <input type="number" min="1" max="99" value={target} onChange={(e) => setTarget(e.target.value)} />
-              </label>
-            )}
-            <button className="btn primary block" onClick={create}>
-              {opponent.local ? 'Empezar partido' : `Invitar a ${opponent.display_name}`}
-            </button>
-          </>
+        )}
+
+        {(flow === 'quick' || (flow === 'invite' && opponent)) && (
+          <GameSetup me={me} opponent={flow === 'invite' ? opponent : null} onStart={create}
+            onCancel={() => { if (opponent) setOpponent(null); else setFlow(null) }} />
         )}
         {err && <p className="err">{err}</p>}
       </section>
@@ -966,20 +1194,29 @@ function Match({ id, me, onExit }) {
   const [s, dispatch] = useReducer(scoreReducer, { game: newGame(), past: [] })
   const [toast, setToast] = useState(null)
   const [showSetup, setShowSetup] = useState(false)
-  const [autoSpeak, setAutoSpeak] = useState(() => lsGet('autoSpeak', true))
+  const [soundOn, setSoundOn] = useState(() => lsGet('soundOn', true)) // sonidos en este teléfono
+  const [timeUp, setTimeUp] = useState(false)
+  const [now, setNow] = useState(() => Date.now())
   const slots = useSyncExternalStore(itags.subscribe, itags.snapshot)
   const keys = useSyncExternalStore(selfie.subscribe, selfie.snapshot)
   const chRef = useRef(null)
   const localRef = useRef(false)
+  const mountedAt = useRef(Date.now())
   useWakeLock(true)
 
-  const cfg = match ? { mode: match.mode, target: match.target } : { mode: 'tennis', target: 11 }
+  const g = s.game
+  const cfg = g.cfg ?? legacyCfg(match)
   const names = match ? [match.player1_name, match.player2_name] : ['', '']
   const mySlot = match?.player2_id === me.id && match?.host_id !== me.id ? 1 : 0
   const finished = match?.status === 'finished'
 
   // Cargar partido + suscripción en tiempo real
   useEffect(() => {
+    if (DEMO && id === 'demo') { // solo en desarrollo: partido de prueba sin base de datos
+      setMatch({ id, status: 'active', host_id: me.id, player1_name: 'Ana y Luis', player2_name: 'Sol y Mar' })
+      dispatch({ type: 'remote', game: { ...newGame({ ...DEFAULT_CFG, minutes: 1 }), v: 1 } })
+      return
+    }
     let alive = true
     supabase.from('matches').select('*').eq('id', id).single().then(({ data }) => {
       if (!alive || !data) return
@@ -1000,27 +1237,86 @@ function Match({ id, me, onExit }) {
 
   // Acción local → aplicar, transmitir y guardar
   const act = useCallback((type, p) => {
-    if (match?.status === 'finished') return
+    if (finished) return
     localRef.current = true
-    dispatch({ type, p, cfg: { mode: match?.mode ?? 'tennis', target: match?.target ?? 11 }, v: Date.now() })
-    if (type === 'point') blip(p === 0 ? 880 : 660)
-    if (type === 'undo') { blip(330); setToast('↩ Punto devuelto') }
-    if (type === 'reset') { blip(220); setToast('🧹 Marcador borrado · doble toque para recuperarlo') }
-  }, [match?.mode, match?.target, match?.status])
+    dispatch({ type, p, cfg, v: Date.now() })
+    if (type === 'undo') setToast('↩ Punto devuelto')
+    if (type === 'reset') setToast('🧹 Marcador borrado · doble toque para recuperarlo')
+  }, [finished, cfg])
+
+  const finishMatch = useCallback(async (game) => {
+    const w = winnerSlot(game)
+    if (DEMO && id === 'demo') return setMatch((m) => ({ ...m, status: 'finished', winner_slot: w }))
+    const { data } = await supabase.from('matches').update({
+      status: 'finished', state: game, finished_at: new Date().toISOString(),
+      winner_slot: w, winner_name: w === null ? null : names[w],
+    }).eq('id', id).select().single()
+    if (data) setMatch(data)
+  }, [id, names])
 
   const saveTimer = useRef()
   useEffect(() => {
     if (!localRef.current) return
     localRef.current = false
-    chRef.current?.send({ type: 'broadcast', event: 'state', payload: { game: s.game, past: s.past.slice(-30) } })
+    chRef.current?.send({ type: 'broadcast', event: 'state', payload: { game: g, past: s.past.slice(-30) } })
     clearTimeout(saveTimer.current)
-    saveTimer.current = setTimeout(() => supabase.from('matches').update({ state: s.game }).eq('id', id), 400)
-    if (autoSpeak && match) speak(announceText(s.game, cfg, names))
-  }, [s.game]) // eslint-disable-line react-hooks/exhaustive-deps
+    // Ganó los sets configurados: se finaliza solo
+    if (g.winner === 0 || g.winner === 1) { finishMatch(g); return }
+    if (DEMO && id === 'demo') return
+    saveTimer.current = setTimeout(() => supabase.from('matches').update({ state: g }).eq('id', id), 400)
+  }, [g]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Sonidos y voz de cada acción (también las que llegan del otro teléfono)
+  const lastEvt = useRef(null)
+  const prevGame = useRef(g)
+  useEffect(() => {
+    const prev = prevGame.current
+    prevGame.current = g
+    const e = g.evt
+    if (!e || e.id === lastEvt.current || e.id < mountedAt.current || !match) return
+    lastEvt.current = e.id
+    if (!soundOn) return
+    if (e.type === 'point') {
+      const p = e.p
+      const wonGame = !isPoints(cfg) && g.games[p] + g.sets[p] > prev.games[p] + prev.sets[p] && g.points[0] + g.points[1] === 0
+      const wonSet = g.sets[p] > (prev.sets?.[p] ?? 0)
+      const wonMatch = g.winner === p
+      if (cfg.applause) applause(wonMatch ? 3 : wonSet ? 2.6 : wonGame ? 2 : 1.4, wonMatch || wonSet ? 0.7 : 0.5)
+      else blip(p === 0 ? 880 : 660)
+      const parts = []
+      if (wonMatch) parts.push(`¡${names[p]} gana el partido!`)
+      else {
+        if (cfg.voiceName) parts.push(wonSet ? `Set para ${names[p]}` : wonGame ? `Juego para ${names[p]}` : `Punto para ${names[p]}`)
+        if (cfg.voiceScore) parts.push(announceText(g, cfg, names))
+      }
+      if (parts.length) speak(parts.join('. '))
+    } else if (e.type === 'undo') {
+      blip(330)
+      if (cfg.voiceName || cfg.voiceScore) speak('Punto anulado')
+    } else if (e.type === 'reset') blip(220)
+  }, [g]) // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => { if (toast) { const t = setTimeout(() => setToast(null), 1800); return () => clearTimeout(t) } }, [toast])
 
-  // Conectar los iTag de este dispositivo con el marcador
+  // Reloj: refresca cada segundo y avisa cuando se cumple el tiempo de juego
+  const running = !!g.clock?.start && !g.clock?.pausedAt && !finished
+  useEffect(() => {
+    if (!running) return
+    const t = setInterval(() => setNow(Date.now()), 1000)
+    return () => clearInterval(t)
+  }, [running])
+  const elapsed = clockElapsed(g.clock, now)
+  const limitMs = (Number(cfg.minutes) || 0) * 60000
+  const remaining = limitMs ? limitMs - elapsed : null
+  const timeUpAnnounced = useRef(false)
+  useEffect(() => {
+    if (!limitMs || remaining > 0 || timeUpAnnounced.current || finished) return
+    timeUpAnnounced.current = true
+    setTimeUp(true)
+    if (soundOn) { applause(2.5, 0.6); speak('Tiempo cumplido') }
+  }, [remaining, limitMs, finished, soundOn])
+
+  // Conectar los botones de este dispositivo con el marcador
   const actRef = useRef(act)
   actRef.current = act
   const [pulse, setPulse] = useState({ p: null, n: 0 })
@@ -1039,12 +1335,7 @@ function Match({ id, me, onExit }) {
 
   async function finish() {
     if (!confirm('¿Finalizar el partido?')) return
-    const w = winnerSlot(s.game)
-    const { data } = await supabase.from('matches').update({
-      status: 'finished', state: s.game, finished_at: new Date().toISOString(),
-      winner_slot: w, winner_name: w === null ? null : names[w],
-    }).eq('id', id).select().single()
-    if (data) setMatch(data)
+    finishMatch(g)
   }
 
   if (!match) return <div className="center muted">Cargando partido…</div>
@@ -1056,8 +1347,12 @@ function Match({ id, me, onExit }) {
       </div>
     )
 
-  const g = s.game
   const { a: lbl, note } = labels(g, cfg)
+  const format = [
+    cfg.sport === 'padel' ? 'Pádel' : cfg.sport === 'tennis' ? 'Tenis' : `A ${cfg.target}`,
+    cfg.setsToWin === 1 ? '1 set' : cfg.setsToWin ? `Mejor de ${cfg.setsToWin * 2 - 1}` : null,
+    !isPoints(cfg) && cfg.golden ? 'Punto de oro' : null,
+  ].filter(Boolean).join(' · ')
 
   return (
     <div className="board">
@@ -1074,19 +1369,30 @@ function Match({ id, me, onExit }) {
               <tr key={p}>
                 <td className="nm">{names[p]}</td>
                 {g.setLog.map((set, i) => <td key={i} className={set[p] > set[1 - p] ? 'w' : ''}>{set[p]}</td>)}
-                {cfg.mode === 'tennis' && <td className="cur">{g.games[p]}</td>}
+                {!isPoints(cfg) && <td className="cur">{g.games[p]}</td>}
                 <td className="tot">{g.sets[p]}</td>
               </tr>
             ))}
           </tbody>
         </table>
         {note && <div className="note">{note}</div>}
+        <button className={`clock ${remaining !== null && remaining <= 0 ? 'over' : ''} ${g.clock?.pausedAt ? 'paused' : ''}`}
+          onClick={() => act('clock')} title="Iniciar / pausar el reloj">
+          {!g.clock?.start ? '▶ Iniciar reloj' : <>
+            {g.clock.pausedAt ? '⏸' : '⏱'} {remaining !== null
+              ? (remaining > 0 ? `${fmtClock(remaining)} restantes` : `Tiempo cumplido +${fmtClock(-remaining)}`)
+              : fmtClock(elapsed)}
+          </>}
+        </button>
+        <div className="format">{format}</div>
       </div>
 
       <div className="toolbar">
         <button title="Salir" onClick={onExit}>←</button>
         <button title="Deshacer" className="orange" onClick={() => act('undo', 0)}>↶</button>
         <button title="Anunciar" className="blue" onClick={() => speak(announceText(g, cfg, names))}>📢</button>
+        <button title={soundOn ? 'Silenciar este teléfono' : 'Activar sonido'}
+          onClick={() => { setSoundOn(!soundOn); lsSet('soundOn', !soundOn) }}>{soundOn ? '🔊' : '🔇'}</button>
         <button title="Cambiar saque" onClick={() => act('server', 0)}>🎾⇄</button>
         <button title="Botones (iTag, rastreador, selfie)" onClick={() => setShowSetup(true)}>
           📡 {[0, 1].filter((p) => slots[p]?.status === 'connected' || keys.keys[p]).length}/2
@@ -1097,9 +1403,19 @@ function Match({ id, me, onExit }) {
 
       {toast && <div className="toast">{toast}</div>}
 
+      {timeUp && !finished && (
+        <div className="timeup">
+          <b>⏱ ¡Tiempo cumplido!</b>
+          <span>
+            <button className="btn sm" onClick={() => setTimeUp(false)}>Seguir jugando</button>
+            <button className="btn primary sm" onClick={() => finishMatch(g)}>🏁 Finalizar</button>
+          </span>
+        </div>
+      )}
+
       {showSetup && (
-        <ItagSetup names={names} mySlot={mySlot} slots={slots} keys={keys} pulse={pulse} autoSpeak={autoSpeak}
-          setAutoSpeak={(v) => { setAutoSpeak(v); lsSet('autoSpeak', v) }} onClose={() => setShowSetup(false)} />
+        <ItagSetup names={names} mySlot={mySlot} slots={slots} keys={keys} pulse={pulse} autoSpeak={soundOn}
+          setAutoSpeak={(v) => { setSoundOn(v); lsSet('soundOn', v) }} onClose={() => setShowSetup(false)} />
       )}
 
       {finished && <Winner match={match} game={g} names={names} onExit={onExit} />}
@@ -1269,7 +1585,7 @@ function ItagSetup({ names, mySlot, slots, keys, pulse, autoSpeak, setAutoSpeak,
         </div>
         <label className="inline small">
           <input type="checkbox" checked={autoSpeak} onChange={(e) => setAutoSpeak(e.target.checked)} />
-          Anunciar el marcador en voz alta
+          Sonidos y voz en este teléfono
         </label>
         <p className="muted small">📺 Para verlo en la TV usa “Duplicar pantalla” (Android / Chromecast) o AirPlay
           (iPhone) y pulsa ⛶.</p>
@@ -1293,13 +1609,14 @@ function Winner({ match, game, names, onExit }) {
                 <td className="nm">{names[p]}</td>
                 {game.setLog.map((s, i) => <td key={i}>{s[p]}</td>)}
                 {(game.games[0] + game.games[1] > 0 || game.points[0] + game.points[1] > 0) && (
-                  <td className="cur">{match.mode === 'tennis' ? game.games[p] : game.points[p]}</td>
+                  <td className="cur">{isPoints(game.cfg ?? legacyCfg(match)) ? game.points[p] : game.games[p]}</td>
                 )}
                 <td className="tot">{game.sets[p]}</td>
               </tr>
             ))}
           </tbody>
         </table>
+        {game.clock?.start && <p className="muted small">⏱ Duración: {fmtClock(clockElapsed(game.clock))}</p>}
         <button className="btn primary block" onClick={onExit}>Volver al inicio</button>
       </div>
     </div>
