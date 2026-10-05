@@ -382,3 +382,28 @@ input[type='number'] { width: 90px; }
   font-size: 1.3rem; animation: pop 0.35s cubic-bezier(.2, 1.4, .4, 1);
 }
 .timeup span { display: flex; gap: 8px; }
+
+/* ───────── consentimiento y recuperar datos ───────── */
+.consent-check { display: flex; gap: 10px; align-items: flex-start; font-size: 0.85rem; line-height: 1.4; color: rgba(255, 255, 255, 0.85); cursor: pointer; }
+.consent-check input { width: 20px; height: 20px; margin-top: 1px; accent-color: var(--lime-dark); flex: none; }
+.linkbtn.inline { margin: 0; padding: 0; font-size: inherit; text-decoration: underline; display: inline; }
+.legal { margin: 10px 0 0; font-size: 0.75rem; color: rgba(255, 255, 255, 0.6); text-align: center; }
+.btn-outline {
+  width: 100%; margin-top: 12px; padding: 13px 14px; border-radius: 14px; cursor: pointer; font-weight: 800; font-size: 0.95rem;
+  background: transparent; color: #fff; border: 1.5px solid rgba(255, 255, 255, 0.35); transition: background 0.2s;
+}
+.btn-outline:hover { background: rgba(255, 255, 255, 0.08); }
+.btn-outline:disabled { opacity: 0.5; }
+.consent-bg { z-index: 60; }
+.consent-sheet { width: min(560px, 100%); }
+.consent-sheet h3 { margin-bottom: 2px; }
+.consent-text { max-height: min(52dvh, 460px); overflow-y: auto; margin: 12px 0; padding: 4px 14px 4px 2px; font-size: 0.88rem; line-height: 1.5; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.consent-text h4 { margin: 14px 0 4px; font-size: 0.92rem; }
+.consent-text p, .consent-text ul { margin: 0 0 6px; }
+.consent-text ul { padding-left: 20px; }
+.consent-actions { display: flex; gap: 10px; justify-content: flex-end; }
+.consent-actions .btn.block { margin-top: 0; }
+.consent-note { background: #fff4e5; color: #8a4b00; padding: 8px 10px; border-radius: 10px; margin: 0 0 10px; }
+.danger-zone { border: 1.5px solid #f4c7c9; background: #fff5f5; border-radius: 14px; padding: 12px; margin: 0 0 12px; display: grid; gap: 6px; justify-items: start; }
+.danger-zone p { margin: 0; }
+.btn.danger { background: var(--red); color: #fff; }

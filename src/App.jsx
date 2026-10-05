@@ -5,6 +5,7 @@ import { createClient } from '@supabase/supabase-js'
 import { Capacitor } from '@capacitor/core'
 import { BleClient, numberToUUID, numbersToDataView } from '@capacitor-community/bluetooth-le'
 import { VolumeButtons } from '@capacitor-community/volume-buttons'
+import { ForegroundService } from '@capawesome-team/capacitor-android-foreground-service'
 import './App.css'
 
 /* ═════════════════════════ SUPABASE ═════════════════════════ */
@@ -165,15 +166,25 @@ function scoreReducer(s, a) {
 
 /* ═════════════════════════ PULSACIONES (1 = punto, 2 = deshacer, 3 / mantener = borrar) ═════════════════════════ */
 function makeClickDecoder(onAction, wait = 380) {
-  let n = 0, t
-  return () => {
-    n++
-    clearTimeout(t)
-    t = setTimeout(() => {
-      const c = n
-      n = 0
+  let clicks = [] // hora de cada clic aún sin resolver
+  let t
+  const flush = () => {
+    const now = Date.now()
+    // Agrupa clics separados por menos de `wait`; un grupo se cierra cuando pasó `wait` desde su último clic
+    while (clicks.length) {
+      let end = 0
+      while (end + 1 < clicks.length && clicks[end + 1] - clicks[end] <= wait) end++
+      if (end === clicks.length - 1 && now - clicks[end] < wait) break // el último grupo puede seguir creciendo
+      const c = end + 1
+      clicks = clicks.slice(c)
       onAction(c === 1 ? 'point' : c === 2 ? 'undo' : 'reset')
-    }, wait)
+    }
+    if (clicks.length) t = setTimeout(flush, Math.max(20, wait - (now - clicks.at(-1))))
+  }
+  return () => {
+    clicks.push(Date.now())
+    clearTimeout(t)
+    t = setTimeout(flush, wait)
   }
 }
 
@@ -355,6 +366,25 @@ if (typeof window !== 'undefined') {
   window.addEventListener('keyup', (e) => { if (keyUp(keyId(e))) e.preventDefault() }, true)
 }
 
+// App Android: servicio en primer plano para que el marcador y los botones sigan con la pantalla bloqueada
+let bgOn = false
+async function backgroundMode(on, text = '') {
+  if (!isNative || Capacitor.getPlatform() !== 'android') return
+  try {
+    if (on) {
+      const perm = await ForegroundService.checkPermissions()
+      if (perm.display !== 'granted') await ForegroundService.requestPermissions()
+      const opts = { id: 2026, title: 'iTag Score · marcador activo', body: text, smallIcon: 'ic_stat_score', silent: true }
+      if (bgOn) await ForegroundService.updateForegroundService(opts)
+      else await ForegroundService.startForegroundService(opts)
+      bgOn = true
+    } else if (bgOn) {
+      bgOn = false
+      await ForegroundService.stopForegroundService()
+    }
+  } catch { /* sin servicio: la app sigue funcionando con la pantalla encendida */ }
+}
+
 // App nativa: el botón "iOS" del selfie (Subir volumen) llega como botón de volumen del teléfono
 let volumeWatching = false
 async function watchVolumeButtons(on) {
@@ -465,6 +495,7 @@ export default function App() {
   const [newPassword, setNewPassword] = useState(() =>
     import.meta.env.DEV && window.location.hash === '#demo-clave' ? generatePassword() : null)
   const [recoveryError, setRecoveryError] = useState(null)
+  const [foundUser, setFoundUser] = useState(null) // usuario mostrado desde "¿Olvidaste tu contraseña?"
 
   // Tras validar la recuperación por correo: genera una clave nueva y la muestra 5 s
   const revealing = useRef(false)
@@ -489,6 +520,15 @@ export default function App() {
   }, [issueNewPassword])
 
   useEffect(() => {
+    const pending = lsGet('pendingConsent', null)
+    if (!session || !pending || session.user.user_metadata?.consent_version) return
+    lsSet('pendingConsent', null)
+    supabase.auth.updateUser({ data: pending }).then(({ data }) => {
+      if (data?.user) setSession((x) => ({ ...x, user: data.user }))
+    })
+  }, [session])
+
+  useEffect(() => {
     if (!session) { setProfile(null); return }
     const meta = session.user.user_metadata ?? {}
     supabase.from('profiles').select('*').eq('id', session.user.id).single()
@@ -501,7 +541,10 @@ export default function App() {
 
   const overlays = (
     <>
-      {newPassword && <PasswordReveal password={newPassword} onClose={() => setNewPassword(null)} />}
+      {newPassword && <SecretReveal title="Tu nueva clave de acceso" note="ya iniciaste sesión con ella" value={newPassword}
+        seconds={5} onClose={() => setNewPassword(null)} />}
+      {foundUser && <SecretReveal title="Tu usuario es" note="úsalo para entrar" value={foundUser}
+        seconds={3} autoCopy onClose={() => setFoundUser(null)} />}
       {recoveryError && (
         <div className="modal" onClick={() => setRecoveryError(null)}>
           <div className="card sheet center-text"><p className="err">{recoveryError}</p>
@@ -517,8 +560,19 @@ export default function App() {
     return <div className="home"><section className="card"><h3>Nuevo partido</h3>
       <GameSetup me={{ display_name: 'Ana y Luis' }} onStart={async (c, n) => console.log('start', c, n)} onCancel={() => {}} /></section></div>
   if (session === undefined) return <div className="center muted">Cargando…</div>
-  if (!session) return <><Auth onRecovered={issueNewPassword} />{overlays}</>
+  if (!session) return <><Auth onRecovered={issueNewPassword} onFoundUser={setFoundUser} />{overlays}</>
   if (!profile) return <div className="center muted">Cargando perfil…</div>
+  if (!session.user.user_metadata?.consent_version)
+    return (
+      <ConsentModal mandatory
+        onAccept={async () => {
+          const { data } = await supabase.auth.updateUser({ data: consentStamp() })
+          if (data?.user) setSession((x) => ({ ...x, user: data.user }))
+        }}
+        onDecline={() => supabase.auth.signOut()}>
+        <p className="small consent-note">Para seguir usando la app necesitamos que aceptes este pliego.</p>
+      </ConsentModal>
+    )
   return (
     <>
       {matchId
@@ -619,7 +673,9 @@ function Field({ icon, label, type = 'text', value, onChange, hint, hintOk, ...r
 
 function translateAuthError(m = '') {
   const map = [
-    [/invalid login credentials/i, 'Correo o contraseña incorrectos'],
+    [/invalid login credentials/i, 'Usuario, correo o contraseña incorrectos'],
+    [/login_email|username_for_email|delete_my_account|could not find the function/i,
+      'Falta actualizar la base de datos: ejecuta supabase/schema.sql en Supabase'],
     [/email not confirmed/i, 'Confirma tu correo antes de entrar'],
     [/user already registered/i, 'Ese correo ya tiene una cuenta'],
     [/password should be at least/i, 'La contraseña debe tener al menos 6 caracteres'],
@@ -634,14 +690,92 @@ function translateAuthError(m = '') {
   return typeof hit === 'function' ? hit(m) : hit ?? m
 }
 
+/* ─────────────── Pliego de consentimiento (tratamiento de datos) ─────────────── */
+const CONSENT_VERSION = '1.0-2026-10'
+const consentStamp = () => ({ consent_version: CONSENT_VERSION, consent_at: new Date().toISOString() })
+
+function ConsentText() {
+  return (
+    <div className="consent-text">
+      <p className="muted small">Versión {CONSENT_VERSION}</p>
+      <h4>1. ¿Quién trata tus datos?</h4>
+      <p>El administrador de la aplicación <b>iTag Score</b> (en adelante, “la app”) es responsable del tratamiento
+        de los datos personales que entregas al registrarte y usarla.</p>
+
+      <h4>2. ¿Qué datos recopilamos?</h4>
+      <ul>
+        <li><b>Datos de tu cuenta:</b> nombre, nombre de usuario y correo electrónico.</li>
+        <li><b>Contraseña:</b> se guarda cifrada; nadie, ni el administrador, puede verla.</li>
+        <li><b>Datos de los partidos:</b> nombres de los jugadores o parejas que escribas, marcadores, sets,
+          duración, fecha, ganador e invitaciones entre usuarios.</li>
+        <li><b>Si entras con Google, Apple u otro proveedor:</b> el nombre y el correo que ese proveedor comparta.</li>
+      </ul>
+      <p>Los botones Bluetooth (iTag, rastreadores o selfie) y las preferencias de sonido se guardan
+        <b> solo en tu teléfono</b>. La app no recopila tu ubicación, contactos, fotos ni audio.</p>
+
+      <h4>3. ¿Para qué los usamos?</h4>
+      <ul>
+        <li>Crear tu cuenta, permitirte entrar con tu usuario o correo y recuperar el acceso.</li>
+        <li>Que otros jugadores registrados te encuentren e inviten: <b>tu nombre y tu usuario son visibles</b>
+          para los demás usuarios. <b>Tu correo no se muestra</b> en la lista de jugadores.</li>
+        <li>Guardar y sincronizar en vivo el marcador y el historial de tus partidos.</li>
+      </ul>
+      <p>En la opción “¿Olvidaste tus datos?”, quien escriba tu correo verá el usuario asociado a él.</p>
+
+      <h4>4. ¿Dónde se guardan?</h4>
+      <p>En los servidores de <b>Supabase</b>, el proveedor de base de datos de la app, con conexión cifrada (HTTPS).
+        <b> No vendemos ni cedemos tus datos</b> a terceros con fines comerciales o publicitarios.</p>
+
+      <h4>5. ¿Por cuánto tiempo?</h4>
+      <p>Mientras tengas tu cuenta. Al eliminarla se borran tu perfil y los partidos que creaste.</p>
+
+      <h4>6. Tus derechos</h4>
+      <p>Puedes conocer, actualizar y rectificar tus datos, revocar este consentimiento y
+        <b> eliminar tu cuenta en cualquier momento</b> desde <i>🔒 Privacidad → Eliminar mi cuenta</i>.</p>
+
+      <h4>7. Menores de edad</h4>
+      <p>Si eres menor de edad, debes usar la app con autorización de tu madre, padre o tutor.</p>
+
+      <h4>8. Aceptación</h4>
+      <p>Al marcar la casilla o pulsar <b>“Acepto”</b> declaras que leíste este pliego y autorizas de forma libre,
+        previa, expresa e informada el tratamiento de tus datos para las finalidades descritas.</p>
+    </div>
+  )
+}
+
+function ConsentModal({ onAccept, onClose, onDecline, mandatory = false, readOnly = false, children }) {
+  return (
+    <div className="modal consent-bg" onClick={mandatory ? undefined : onClose}>
+      <div className="card sheet consent-sheet" onClick={(e) => e.stopPropagation()} role="dialog" aria-label="Pliego de consentimiento">
+        <h3>📄 Pliego de consentimiento</h3>
+        <p className="muted small">Tratamiento de datos personales de iTag Score</p>
+        <ConsentText />
+        {children}
+        <div className="consent-actions">
+          {readOnly ? (
+            <button className="btn primary block" onClick={onClose}>Cerrar</button>
+          ) : (
+            <>
+              <button className="btn ghost" onClick={mandatory ? onDecline : onClose}>{mandatory ? 'No acepto (salir)' : 'Cancelar'}</button>
+              <button className="btn primary" onClick={onAccept}>✓ Acepto</button>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 /* ─────────────── Login / Registro / Recuperar ─────────────── */
-function Auth({ onRecovered }) {
+function Auth({ onRecovered, onFoundUser }) {
   const [view, setView] = useState('login') // login | signup | forgot | code
   const [f, setF] = useState({ name: '', username: '', email: '', password: '', code: '' })
   const [msg, setMsg] = useState(null)
   const [busy, setBusy] = useState(false)
   const [shake, setShake] = useState(0)
   const [userFree, setUserFree] = useState(null)
+  const [consent, setConsent] = useState(false)
+  const [showConsent, setShowConsent] = useState(null) // null | 'read' | proveedor OAuth pendiente
   const providers = useEnabledProviders()
   const up = (k) => (e) => setF((x) => ({ ...x, [k]: e.target.value }))
   const go = (v) => { setView(v); setMsg(null) }
@@ -677,16 +811,28 @@ function Auth({ onRecovered }) {
     run(async () => {
       const email = f.email.trim()
       if (view === 'login') {
-        const { error } = await supabase.auth.signInWithPassword({ email, password: f.password })
+        // Acepta usuario o correo: el usuario se cambia por su correo solo si la contraseña es correcta
+        let loginEmail = email
+        if (!email.includes('@')) {
+          const { data, error } = await supabase.rpc('login_email', { identifier: email, pass: f.password })
+          if (error) throw error
+          if (!data) throw new Error('Usuario o contraseña incorrectos')
+          loginEmail = data
+        }
+        const { error } = await supabase.auth.signInWithPassword({ email: loginEmail, password: f.password })
         if (error) throw error
       } else if (view === 'signup') {
         const username = f.username.trim().toLowerCase()
         if (userFree === 'invalid') throw new Error('Usuario: 3-20 letras minúsculas, números o _')
         if (userFree === 'taken') throw new Error('Ese usuario ya existe')
+        if (!consent) throw new Error('Debes aceptar el pliego de consentimiento para crear tu cuenta')
         const { data, error } = await supabase.auth.signUp({
           email,
           password: f.password,
-          options: { data: { username, display_name: f.name.trim() || username }, emailRedirectTo: REDIRECT_URL },
+          options: {
+            data: { username, display_name: f.name.trim() || username, ...consentStamp() },
+            emailRedirectTo: REDIRECT_URL,
+          },
         })
         if (error) throw error
         if (!data.session) {
@@ -694,10 +840,11 @@ function Auth({ onRecovered }) {
           setMsg({ ok: true, text: '✉️ Te enviamos un correo para confirmar tu cuenta.' })
         }
       } else if (view === 'forgot') {
-        const { error } = await supabase.auth.resetPasswordForEmail(email, { redirectTo: REDIRECT_URL })
+        const { data, error } = await supabase.rpc('username_for_email', { e: email })
         if (error) throw error
-        setView('code')
-        setMsg({ ok: true, text: `✉️ Enviamos un correo a ${email}. Abre el enlace o escribe aquí el código.` })
+        if (!data) throw new Error('No hay ninguna cuenta con ese correo')
+        onFoundUser(data)
+        setMsg({ ok: true, text: '¿Tampoco recuerdas la contraseña? Pide un correo para crear una nueva.' })
       } else if (view === 'code') {
         const { error } = await supabase.auth.verifyOtp({ email, token: f.code.trim(), type: 'recovery' })
         if (error) throw error
@@ -706,20 +853,31 @@ function Auth({ onRecovered }) {
     })
   }
 
-  const oauth = (provider) => run(async () => {
+  const sendRecovery = () => run(async () => {
+    const email = f.email.trim()
+    if (!email.includes('@')) throw new Error('Escribe tu correo electrónico')
+    const { error } = await supabase.auth.resetPasswordForEmail(email, { redirectTo: REDIRECT_URL })
+    if (error) throw error
+    setView('code')
+    setMsg({ ok: true, text: `✉️ Enviamos un correo a ${email}. Abre el enlace o escribe aquí el código.` })
+  })
+
+  const startOAuth = (provider) => run(async () => {
+    lsSet('pendingConsent', consentStamp()) // se guarda en la cuenta al volver del proveedor
     const { error } = await supabase.auth.signInWithOAuth({ provider, options: { redirectTo: REDIRECT_URL } })
     if (error) throw error
   })
+  const oauth = (provider) => (consent ? startOAuth(provider) : setShowConsent(provider))
 
   const score = passwordScore(f.password)
   const titles = {
     login: ['Bienvenido de vuelta', 'Entra para llevar el marcador'],
     signup: ['Crea tu cuenta', 'En menos de 30 segundos'],
-    forgot: ['¿Olvidaste tu clave?', 'Te ayudamos a recuperarla con tu correo'],
+    forgot: ['¿Olvidaste tus datos?', 'Escribe tu correo y te mostramos tu usuario'],
     code: ['Revisa tu correo', 'Valida que eres tú'],
   }
   const cta = {
-    login: 'Entrar', signup: 'Crear cuenta', forgot: 'Enviar correo de recuperación', code: 'Validar y ver mi nueva clave',
+    login: 'Entrar', signup: 'Crear cuenta', forgot: '👤 Ver mi usuario', code: 'Validar y ver mi nueva clave',
   }
   const hints = { invalid: '3-20 letras minúsculas, números o _', checking: 'Comprobando…', free: '✓ Disponible', taken: '✗ Ya está en uso' }
 
@@ -751,7 +909,11 @@ function Auth({ onRecovered }) {
               </>
             )}
 
-            {view !== 'code' && (
+            {view === 'login' && (
+              <Field icon="👤" label="Usuario o correo" value={f.email} onChange={up('email')}
+                autoComplete="username" autoCapitalize="none" spellCheck={false} required />
+            )}
+            {(view === 'signup' || view === 'forgot') && (
               <Field icon="✉️" label="Correo electrónico" type="email" value={f.email} onChange={up('email')}
                 autoComplete="email" inputMode="email" required />
             )}
@@ -774,13 +936,28 @@ function Auth({ onRecovered }) {
             )}
 
             {view === 'login' && (
-              <button type="button" className="linkbtn right" onClick={() => go('forgot')}>¿Olvidaste tu contraseña?</button>
+              <button type="button" className="linkbtn right" onClick={() => go('forgot')}>¿Olvidaste tu usuario o contraseña?</button>
+            )}
+
+            {view === 'signup' && (
+              <label className="consent-check">
+                <input type="checkbox" checked={consent} onChange={(e) => setConsent(e.target.checked)} />
+                <span>He leído y acepto el{' '}
+                  <button type="button" className="linkbtn inline" onClick={() => setShowConsent('read')}>pliego de consentimiento</button>
+                  {' '}para el tratamiento de mis datos (nombre, usuario y correo).</span>
+              </label>
             )}
 
             {msg && <p className={`msg ${msg.ok ? 'ok' : 'err'}`}>{msg.text}</p>}
 
             <button className="cta" disabled={busy}>{busy ? <span className="spinner" /> : cta[view]}</button>
           </form>
+
+          {view === 'forgot' && (
+            <button type="button" className="btn-outline" disabled={busy} onClick={sendRecovery}>
+              🔑 Enviar correo para crear una contraseña nueva
+            </button>
+          )}
 
           {(view === 'forgot' || view === 'code') && (
             <button type="button" className="linkbtn" onClick={() => go('login')}>← Volver a entrar</button>
@@ -797,47 +974,60 @@ function Auth({ onRecovered }) {
                   </button>
                 ))}
               </div>
+              <p className="legal">Al continuar con un proveedor aceptas el{' '}
+                <button type="button" className="linkbtn inline" onClick={() => setShowConsent('read')}>pliego de consentimiento</button>.</p>
             </>
           )}
         </div>
       </div>
+
+      {showConsent && (
+        <ConsentModal
+          onAccept={() => {
+            const pending = showConsent
+            setConsent(true)
+            setShowConsent(null)
+            if (pending !== 'read') startOAuth(pending)
+          }}
+          onClose={() => setShowConsent(null)} />
+      )}
     </div>
   )
 }
 
-/* Ventana emergente: nueva clave visible 5 s con botón para copiar */
-function PasswordReveal({ password, onClose }) {
-  const SECONDS = 5
-  const [left, setLeft] = useState(SECONDS)
+/* Ventana emergente con un dato (clave o usuario) visible unos segundos y botón para copiarlo */
+function SecretReveal({ title, note, value, seconds = 5, autoCopy = false, onClose }) {
+  const [left, setLeft] = useState(seconds)
   const [copied, setCopied] = useState(false)
   const closeRef = useRef(onClose)
   closeRef.current = onClose
 
   useEffect(() => {
+    if (autoCopy) copyText(value).then(setCopied) // copiado automático al abrir
     const started = Date.now()
     const t = setInterval(() => {
-      const l = SECONDS - (Date.now() - started) / 1000
+      const l = seconds - (Date.now() - started) / 1000
       if (l <= 0) {
         clearInterval(t)
         closeRef.current()
       } else setLeft(l)
     }, 100)
     return () => clearInterval(t)
-  }, [])
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
     <div className="modal reveal-bg">
-      <div className="reveal" role="dialog" aria-label="Tu nueva clave de acceso">
+      <div className="reveal" role="dialog" aria-label={title}>
         <svg className="ring" viewBox="0 0 44 44" aria-hidden>
           <circle cx="22" cy="22" r="20" />
-          <circle cx="22" cy="22" r="20" className="prog" style={{ strokeDashoffset: 125.66 * (1 - left / SECONDS) }} />
+          <circle cx="22" cy="22" r="20" className="prog" style={{ strokeDashoffset: 125.66 * (1 - left / seconds) }} />
           <text x="22" y="27">{Math.ceil(left)}</text>
         </svg>
-        <h2>Tu nueva clave de acceso</h2>
-        <p className="muted small">Se ocultará en {Math.ceil(left)} s · ya iniciaste sesión con ella</p>
-        <code className="pwd">{password}</code>
-        <button className={`cta ${copied ? 'done' : ''}`} onClick={async () => setCopied(await copyText(password))}>
-          {copied ? '✓ Copiada al portapapeles' : '📋 Copiar clave'}
+        <h2>{title}</h2>
+        <p className="muted small">Se ocultará en {Math.ceil(left)} s{note ? ` · ${note}` : ''}</p>
+        <code className="pwd">{value}</code>
+        <button className={`cta ${copied ? 'done' : ''}`} onClick={async () => setCopied(await copyText(value))}>
+          {copied ? '✓ Copiado al portapapeles' : '📋 Copiar'}
         </button>
       </div>
     </div>
@@ -987,6 +1177,7 @@ function Home({ me, onOpen }) {
   const [q, setQ] = useState('')
   const [results, setResults] = useState([])
   const [flow, setFlow] = useState(null) // null | 'quick' | 'invite'
+  const [privacy, setPrivacy] = useState(false)
   const [opponent, setOpponent] = useState(null) // perfil del jugador invitado
   const [matches, setMatches] = useState([])
   const [err, setErr] = useState(null)
@@ -1085,6 +1276,7 @@ function Home({ me, onOpen }) {
         <div className="brand sm"><span className="ball" /> iTag Score</div>
         <div className="who">
           <b>{me.display_name}</b> <span className="muted">@{me.username}</span>
+          <button className="btn ghost sm" onClick={() => setPrivacy(true)}>🔒 Privacidad</button>
           <button className="btn ghost sm" onClick={() => supabase.auth.signOut()}>Salir</button>
         </div>
       </header>
@@ -1176,6 +1368,21 @@ function Home({ me, onOpen }) {
             </div>
           ))}
         </section>
+      )}
+
+      {privacy && (
+        <ConsentModal readOnly onClose={() => setPrivacy(false)}>
+          <div className="danger-zone">
+            <b>Eliminar mi cuenta</b>
+            <p className="small muted">Borra tu perfil, tus datos de acceso y los partidos que creaste. No se puede deshacer.</p>
+            <button className="btn danger" onClick={async () => {
+              if (!confirm('¿Eliminar tu cuenta y tus datos para siempre? No se puede deshacer.')) return
+              const { error } = await supabase.rpc('delete_my_account')
+              if (error) return alert(translateAuthError(error.message))
+              await supabase.auth.signOut()
+            }}>🗑 Eliminar mi cuenta</button>
+          </div>
+        </ConsentModal>
       )}
 
       {!bleSupported && (
@@ -1315,6 +1522,15 @@ function Match({ id, me, onExit }) {
     setTimeUp(true)
     if (soundOn) { applause(2.5, 0.6); speak('Tiempo cumplido') }
   }, [remaining, limitMs, finished, soundOn])
+
+  // Segundo plano (Android): notificación fija con el marcador mientras el partido está abierto
+  const bgText = match && !finished ? `${names[0]} ${labels(g, cfg).a[0]} - ${labels(g, cfg).a[1]} ${names[1]}` : ''
+  useEffect(() => {
+    if (!match || finished || (DEMO && id === 'demo')) return
+    backgroundMode(true, bgText)
+  }, [bgText]) // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => () => { backgroundMode(false) }, [])
+  useEffect(() => { if (finished) backgroundMode(false) }, [finished])
 
   // Conectar los botones de este dispositivo con el marcador
   const actRef = useRef(act)

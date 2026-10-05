@@ -55,6 +55,12 @@ Los iTag avisan cada pulsación con una notificación en el servicio `0xFFE0` y 
 
 ## Login
 
+- **Entrar con usuario o correo**: si escribes el usuario, la base de datos lo cambia por tu correo solo si la contraseña es correcta.
+- **¿Olvidaste tus datos?**: escribes tu correo y una ventana muestra tu **usuario durante 3 segundos** y lo copia
+  automáticamente. Desde ahí también puedes pedir un correo para crear una contraseña nueva.
+- **Pliego de consentimiento**: obligatorio al registrarse, al entrar con un proveedor y, una vez, para las cuentas que ya existían.
+  En el inicio, **🔒 Privacidad** permite leerlo y **eliminar la cuenta**.
+
 - **Registro con correo**: nombre, usuario (se valida en vivo contra la base de datos), correo y contraseña con medidor de seguridad.
   Supabase Auth guarda el usuario en `auth.users` y un trigger crea su perfil en `public.profiles`.
 - **Proveedores (Google, Apple, GitHub, Facebook, Microsoft…)**: los botones aparecen solos para cada
@@ -108,6 +114,16 @@ npx cap open ios       # Xcode (requiere Mac) → elige tu equipo de firma → R
 ```
 
 Los permisos de Bluetooth ya están configurados (`AndroidManifest.xml` e `Info.plist`).
+
+## Segundo plano (pantalla bloqueada)
+
+En la **app Android (APK)**, al abrir un partido aparece una notificación fija “iTag Score · marcador activo” con
+el marcador. Es un servicio en primer plano que mantiene la app viva con la pantalla bloqueada, para que los
+**iTag y rastreadores Bluetooth** sigan sumando puntos y suenen los aplausos y la voz. Al salir del partido, la
+notificación desaparece.
+
+Limitaciones: los botones selfie llegan como teclado o volumen, y Android no los entrega a la app con la pantalla
+bloqueada. En la versión web el navegador pausa la página al bloquear la pantalla.
 
 ## Estructura
 

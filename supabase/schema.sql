@@ -109,3 +109,36 @@ where not exists (select 1 from public.profiles p where p.id = u.id)
 on conflict do nothing;
 
 update auth.users set email_confirmed_at = now() where email_confirmed_at is null;
+
+create extension if not exists pgcrypto with schema extensions;
+
+create or replace function public.login_email(identifier text, pass text) returns text language plpgsql security definer set search_path = public, extensions, auth as $$
+declare
+  e text;
+  h text;
+begin
+  select u.email, u.encrypted_password into e, h
+  from auth.users u join public.profiles p on p.id = u.id
+  where p.username = lower(trim(identifier))
+  limit 1;
+  if e is null or h is null or h = '' then return null; end if;
+  if extensions.crypt(pass, h) = h then return e; end if;
+  return null;
+end $$;
+revoke all on function public.login_email(text, text) from public;
+grant execute on function public.login_email(text, text) to anon, authenticated;
+
+create or replace function public.username_for_email(e text) returns text language sql security definer set search_path = public, auth as $$
+  select p.username from public.profiles p join auth.users u on u.id = p.id where lower(u.email) = lower(trim(e)) limit 1;
+$$;
+revoke all on function public.username_for_email(text) from public;
+grant execute on function public.username_for_email(text) to anon, authenticated;
+
+create or replace function public.delete_my_account() returns void language plpgsql security definer set search_path = public, auth as $$
+begin
+  if auth.uid() is null then raise exception 'not authenticated'; end if;
+  delete from public.matches where host_id = auth.uid();
+  delete from auth.users where id = auth.uid();
+end $$;
+revoke all on function public.delete_my_account() from public;
+grant execute on function public.delete_my_account() to authenticated;
